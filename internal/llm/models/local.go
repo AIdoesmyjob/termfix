@@ -54,7 +54,9 @@ func init() {
 			return
 		}
 
-		loadLocalModels(models)
+		// Query /props for actual loaded context size (llama-server)
+		propsCtx := getPropsContextSize(endpoint)
+		loadLocalModels(models, propsCtx)
 
 		viper.SetDefault("providers.local.apiKey", "dummy")
 		ProviderPopularity[ProviderLocal] = 0
@@ -127,9 +129,38 @@ func listLocalModels(modelsEndpoint string) []localModel {
 	return supportedModels
 }
 
-func loadLocalModels(models []localModel) {
+// getPropsContextSize queries the /props endpoint to get the actual loaded context size.
+// Returns 0 if unavailable (non-llama-server backends).
+func getPropsContextSize(endpoint string) int64 {
+	propsURL := strings.TrimRight(endpoint, "/") + "/props"
+	res, err := http.Get(propsURL)
+	if err != nil {
+		return 0
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return 0
+	}
+	var props struct {
+		DefaultGenerationSettings struct {
+			NCtx int64 `json:"n_ctx"`
+		} `json:"default_generation_settings"`
+		TotalSlots int64 `json:"total_slots"`
+	}
+	if err = json.NewDecoder(res.Body).Decode(&props); err != nil {
+		return 0
+	}
+	// Per-slot context = total context / number of slots
+	nCtx := props.DefaultGenerationSettings.NCtx
+	if props.TotalSlots > 1 {
+		nCtx = nCtx / props.TotalSlots
+	}
+	return nCtx
+}
+
+func loadLocalModels(models []localModel, propsCtx int64) {
 	for i, m := range models {
-		model := convertLocalModel(m)
+		model := convertLocalModel(m, propsCtx)
 		SupportedModels[model.ID] = model
 
 		if i == 0 || m.State == "loaded" {
@@ -141,16 +172,29 @@ func loadLocalModels(models []localModel) {
 	}
 }
 
-func convertLocalModel(model localModel) Model {
+func convertLocalModel(model localModel, propsCtx int64) Model {
+	// Prefer: /props context (actual loaded) > LM Studio fields > fallback
+	ctxLen := cmp.Or(propsCtx, model.LoadedContextLength, model.MaxContextLength, 2048)
+	// Reserve half the context for output, half for input (system prompt + tools + history)
+	maxOut := ctxLen / 2
+	logging.Debug("Local model context",
+		"model", model.ID,
+		"propsCtx", propsCtx,
+		"resolved", ctxLen,
+		"maxOut", maxOut,
+	)
+	if maxOut < 512 {
+		maxOut = 512
+	}
 	return Model{
 		ID:                  ModelID("local." + model.ID),
 		Name:                friendlyModelName(model.ID),
 		Provider:            ProviderLocal,
 		APIModel:            model.ID,
-		ContextWindow:       cmp.Or(model.LoadedContextLength, 4096),
-		DefaultMaxTokens:    cmp.Or(model.LoadedContextLength, 4096),
-		CanReason:           true,
-		SupportsAttachments: true,
+		ContextWindow:       ctxLen,
+		DefaultMaxTokens:    int64(maxOut),
+		CanReason:           false,
+		SupportsAttachments: false,
 	}
 }
 
