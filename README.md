@@ -31,6 +31,16 @@ cd termfix-darwin-amd64
 
 That's it. The startup script handles everything: starts the inference server, waits for the model to load, generates config, and launches the TUI.
 
+### macOS: Clear Quarantine Flag
+
+If you downloaded the archive via a browser (Safari, Chrome, etc.), macOS Gatekeeper will block the binaries. The script will detect this and tell you the fix, but you can also do it upfront:
+
+```bash
+xattr -cr termfix-darwin-*/
+```
+
+This only needs to be done once after downloading. If you used `gh release download` or `curl` from the terminal, this step is usually unnecessary.
+
 ## What's in the Box
 
 Each release archive (~1.7 GB) is fully self-contained:

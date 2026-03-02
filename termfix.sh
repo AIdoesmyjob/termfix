@@ -12,11 +12,18 @@ done
 SCRIPT_DIR=$(cd "$(dirname "$SOURCE")" && pwd)
 LLAMA_SERVER="$SCRIPT_DIR/bin/llama-server"
 MODEL_DIR="$SCRIPT_DIR/models"
-SERVER_LOG="$SCRIPT_DIR/.llama-server.log"
 
 # Set library path for llama-server shared libs
 export LD_LIBRARY_PATH="${SCRIPT_DIR}/bin:${LD_LIBRARY_PATH:-}"
 export DYLD_LIBRARY_PATH="${SCRIPT_DIR}/bin:${DYLD_LIBRARY_PATH:-}"
+
+# --- macOS Gatekeeper: clear quarantine attributes if present ---
+if [ "$(uname -s)" = "Darwin" ]; then
+  if xattr -l "$LLAMA_SERVER" 2>/dev/null | grep -q "com.apple.quarantine"; then
+    echo "Clearing macOS quarantine attributes (Gatekeeper)..."
+    xattr -cr "$SCRIPT_DIR" 2>/dev/null || true
+  fi
+fi
 
 # Find model
 MODEL="${TERMFIX_MODEL:-}"
@@ -46,6 +53,9 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; th
 fi
 export LOCAL_ENDPOINT="http://127.0.0.1:${PORT}"
 
+# Port-specific log file (avoids race with concurrent instances)
+SERVER_LOG="$SCRIPT_DIR/.llama-server-${PORT}.log"
+
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
@@ -64,6 +74,34 @@ echo "Starting llama-server on port $PORT with $(basename "$MODEL")..."
   >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
+# Brief pause to let server either start or fail immediately
+sleep 1
+
+# Check if server died immediately (port conflict, permission error, Gatekeeper kill, etc.)
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  wait "$SERVER_PID" 2>/dev/null || true
+  EXIT_CODE=$?
+  echo ""
+  # Exit code 137 = SIGKILL (Gatekeeper quarantine on macOS)
+  if [ "$EXIT_CODE" -eq 137 ] && [ "$(uname -s)" = "Darwin" ]; then
+    echo "ERROR: llama-server was killed by macOS Gatekeeper."
+    echo ""
+    echo "Fix: Run this command, then try again:"
+    echo "  xattr -cr \"$SCRIPT_DIR\""
+    echo ""
+    echo "This clears the quarantine flag that macOS sets on downloaded files."
+  else
+    echo "ERROR: llama-server failed to start (exit code $EXIT_CODE). Log output:"
+    tail -20 "$SERVER_LOG" 2>/dev/null
+    # Check for common errors in the log
+    if grep -q "couldn't bind" "$SERVER_LOG" 2>/dev/null; then
+      echo ""
+      echo "Port $PORT is already in use. Try: TERMFIX_PORT=8013 $0"
+    fi
+  fi
+  exit 1
+fi
+
 # Wait for server to be ready (up to 60s)
 echo -n "Waiting for model to load"
 for i in $(seq 1 60); do
@@ -72,9 +110,18 @@ for i in $(seq 1 60); do
     break
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    wait "$SERVER_PID" 2>/dev/null || true
+    EXIT_CODE=$?
     echo ""
-    echo "ERROR: llama-server failed to start. Log output:"
-    tail -20 "$SERVER_LOG" 2>/dev/null
+    if [ "$EXIT_CODE" -eq 137 ] && [ "$(uname -s)" = "Darwin" ]; then
+      echo "ERROR: llama-server was killed by macOS Gatekeeper."
+      echo ""
+      echo "Fix: Run this command, then try again:"
+      echo "  xattr -cr \"$SCRIPT_DIR\""
+    else
+      echo "ERROR: llama-server exited unexpectedly (exit code $EXIT_CODE). Log output:"
+      tail -20 "$SERVER_LOG" 2>/dev/null
+    fi
     exit 1
   fi
   echo -n "."

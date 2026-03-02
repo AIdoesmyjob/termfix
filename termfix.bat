@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 set "SCRIPT_DIR=%~dp0"
 set "LLAMA_SERVER=%SCRIPT_DIR%bin\llama-server.exe"
 set "MODEL_DIR=%SCRIPT_DIR%models"
-set "SERVER_LOG=%SCRIPT_DIR%.llama-server.log"
+set "SERVER_LOG="
 
 :: Validate TERMFIX_MODEL if set
 if defined TERMFIX_MODEL (
@@ -47,6 +47,7 @@ if %TERMFIX_PORT% GTR 65535 (
     exit /b 1
 )
 set "LOCAL_ENDPOINT=http://127.0.0.1:%TERMFIX_PORT%"
+set "SERVER_LOG=%SCRIPT_DIR%.llama-server-%TERMFIX_PORT%.log"
 
 for %%F in ("%MODEL%") do set "MODEL_BASE=%%~nxF"
 echo Starting llama-server on port %TERMFIX_PORT% with %MODEL_BASE%...
@@ -85,6 +86,11 @@ if defined SERVER_PID (
         if exist "%SERVER_LOG%" (
             echo Log output:
             powershell -Command "Get-Content '%SERVER_LOG%' | Select-Object -Last 20"
+            findstr /c:"couldn't bind" "%SERVER_LOG%" >nul 2>&1
+            if not errorlevel 1 (
+                echo.
+                echo Port %TERMFIX_PORT% is already in use. Try: set TERMFIX_PORT=8013 ^&^& %~nx0
+            )
         )
         goto :cleanup_exit
     )
