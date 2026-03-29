@@ -8,11 +8,15 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/spf13/viper"
 )
+
+// httpClient is a shared client with a timeout for local model discovery.
+var httpClient = &http.Client{Timeout: 5 * time.Second}
 
 const (
 	ProviderLocal ModelProvider = "local"
@@ -79,7 +83,7 @@ type localModel struct {
 }
 
 func listLocalModels(modelsEndpoint string) []localModel {
-	res, err := http.Get(modelsEndpoint)
+	res, err := httpClient.Get(modelsEndpoint)
 	if err != nil {
 		logging.Debug("Failed to list local models",
 			"error", err,
@@ -141,15 +145,34 @@ func loadLocalModels(models []localModel) {
 	}
 }
 
+func isQwen35Model(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	return strings.Contains(lower, "qwen3.5") || strings.Contains(lower, "qwen3_5")
+}
+
 func convertLocalModel(model localModel) Model {
+	contextWindow := cmp.Or(model.LoadedContextLength, int64(4096))
+	defaultMaxTokens := contextWindow
+
+	// Qwen 3.5 0.8B profile: two-pass architecture with capped generation
+	// Pass 1 (tool selection) needs ~5700 tokens (system + tools + user), so 8192 context is required.
+	// Pass 2 (diagnostic) uses ~1900 tokens (system + user + tool output, no tools).
+	// DefaultMaxTokens capped at 1024 to prevent runaway generation in either pass.
+	if isQwen35Model(model.ID) {
+		if contextWindow > 8192 || contextWindow == 4096 {
+			contextWindow = 8192
+		}
+		defaultMaxTokens = 1024
+	}
+
 	return Model{
 		ID:                  ModelID("local." + model.ID),
 		Name:                friendlyModelName(model.ID),
 		Provider:            ProviderLocal,
 		APIModel:            model.ID,
-		ContextWindow:       cmp.Or(model.LoadedContextLength, 4096),
-		DefaultMaxTokens:    cmp.Or(model.LoadedContextLength, 4096),
-		CanReason:           true,
+		ContextWindow:       contextWindow,
+		DefaultMaxTokens:    defaultMaxTokens,
+		CanReason:           false,
 		SupportsAttachments: true,
 	}
 }

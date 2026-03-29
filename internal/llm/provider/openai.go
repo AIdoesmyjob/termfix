@@ -6,6 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"regexp"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/openai/openai-go"
@@ -17,6 +21,19 @@ import (
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/message"
 )
+
+// isConnectionError checks if an error is a connection-level failure
+// (e.g. connection refused when local server isn't ready yet).
+func isConnectionError(err error) bool {
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	return false
+}
 
 type openaiOptions struct {
 	baseURL         string
@@ -125,15 +142,31 @@ func (o *openaiClient) convertMessages(messages []message.Message) (openaiMessag
 	return
 }
 
+// compactToolDescriptions maps tool names to short descriptions for local models.
+// Full descriptions waste thousands of tokens that small models can't afford.
+var compactToolDescriptions = map[string]string{
+	"bash": "Execute a bash command on the system. Use standard Unix commands like df, ps, top, cat, ls, etc.",
+	"view": "View the contents of a file with line numbers. Parameters: file_path (required), offset (optional line number), limit (optional line count).",
+	"glob": "Find files matching a glob pattern. Parameters: pattern (required, e.g. '**/*.go'), path (optional directory).",
+	"grep": "Search file contents for a regex pattern. Parameters: pattern (required), path (optional directory), include (optional file filter like '*.go').",
+}
+
 func (o *openaiClient) convertTools(tools []tools.BaseTool) []openai.ChatCompletionToolParam {
 	openaiTools := make([]openai.ChatCompletionToolParam, len(tools))
+	isLocal := o.providerOptions.model.Provider == models.ProviderLocal
 
 	for i, tool := range tools {
 		info := tool.Info()
+		desc := info.Description
+		if isLocal {
+			if compact, ok := compactToolDescriptions[info.Name]; ok {
+				desc = compact
+			}
+		}
 		openaiTools[i] = openai.ChatCompletionToolParam{
 			Function: openai.FunctionDefinitionParam{
 				Name:        info.Name,
-				Description: openai.String(info.Description),
+				Description: openai.String(desc),
 				Parameters: openai.FunctionParameters{
 					"type":       "object",
 					"properties": info.Parameters,
@@ -163,7 +196,9 @@ func (o *openaiClient) preparedParams(messages []openai.ChatCompletionMessagePar
 	params := openai.ChatCompletionNewParams{
 		Model:    openai.ChatModel(o.providerOptions.model.APIModel),
 		Messages: messages,
-		Tools:    tools,
+	}
+	if len(tools) > 0 {
+		params.Tools = tools
 	}
 
 	if o.providerOptions.model.CanReason == true {
@@ -180,6 +215,14 @@ func (o *openaiClient) preparedParams(messages []openai.ChatCompletionMessagePar
 		}
 	} else {
 		params.MaxTokens = openai.Int(o.providerOptions.maxTokens)
+	}
+
+	// Apply sampling defaults for local models (e.g. Qwen 3.5 0.8B).
+	// Low temperature + tight top_p keeps the small model focused.
+	// No presence_penalty here — llama-server applies --repeat-penalty server-side.
+	if o.providerOptions.model.Provider == models.ProviderLocal {
+		params.Temperature = openai.Float(0.3)
+		params.TopP = openai.Float(0.8)
 	}
 
 	return params
@@ -224,6 +267,16 @@ func (o *openaiClient) send(ctx context.Context, messages []message.Message, too
 
 		toolCalls := o.toolCalls(*openaiResponse)
 		finishReason := o.finishReason(string(openaiResponse.Choices[0].FinishReason))
+
+		// Fallback: if content contains Qwen-style <tool_call> XML but the server
+		// didn't parse it (e.g., malformed closing tags like "</ function>"),
+		// extract the tool call manually.
+		if len(toolCalls) == 0 && strings.Contains(content, "<tool_call>") {
+			if parsed := parseQwenToolCall(content); parsed != nil {
+				toolCalls = []message.ToolCall{*parsed}
+				content = ""
+			}
+		}
 
 		if len(toolCalls) > 0 {
 			finishReason = message.FinishReasonToolUse
@@ -337,6 +390,13 @@ func (o *openaiClient) stream(ctx context.Context, messages []message.Message, t
 func (o *openaiClient) shouldRetry(attempts int, err error) (bool, int64, error) {
 	var apierr *openai.Error
 	if !errors.As(err, &apierr) {
+		// Handle connection errors (e.g. local server not ready) as retryable
+		if isConnectionError(err) && attempts <= maxRetries {
+			backoffMs := int64(2000 * (1 << (attempts - 1)))
+			logging.Debug("Connection error, retrying", "error", err, "attempt", attempts)
+			return true, backoffMs, nil
+		}
+		logging.Debug("Non-API error, not retrying", "error", err)
 		return false, 0, err
 	}
 
@@ -421,5 +481,47 @@ func WithReasoningEffort(effort string) OpenAIOption {
 			logging.Warn("Invalid reasoning effort, using default: medium")
 		}
 		options.reasoningEffort = defaultReasoningEffort
+	}
+}
+
+// parseQwenToolCall extracts a tool call from Qwen-style XML in content.
+// Handles malformed closing tags like "</ function>" and "</ parameter >".
+// Returns nil if no valid tool call is found.
+var qwenFuncNameRe = regexp.MustCompile(`<function=(\w+)>`)
+var qwenParamRe = regexp.MustCompile(`<parameter=(\w+)>\s*([\s\S]*?)\s*<\s*/\s*parameter\s*>`)
+
+func parseQwenToolCall(content string) *message.ToolCall {
+	if !strings.Contains(content, "<tool_call>") {
+		return nil
+	}
+
+	nameMatch := qwenFuncNameRe.FindStringSubmatch(content)
+	if nameMatch == nil {
+		return nil
+	}
+	funcName := nameMatch[1]
+
+	// Extract all parameters
+	params := make(map[string]string)
+	for _, match := range qwenParamRe.FindAllStringSubmatch(content, -1) {
+		params[match[1]] = strings.TrimSpace(match[2])
+	}
+
+	// Build JSON arguments from parameters
+	args := make(map[string]interface{})
+	for k, v := range params {
+		args[k] = v
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return nil
+	}
+
+	return &message.ToolCall{
+		ID:       fmt.Sprintf("qwen_%s_%d", funcName, time.Now().UnixNano()),
+		Name:     funcName,
+		Input:    string(argsJSON),
+		Type:     "function",
+		Finished: true,
 	}
 }

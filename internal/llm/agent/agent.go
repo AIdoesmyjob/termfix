@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -231,7 +232,6 @@ func (a *agent) Run(ctx context.Context, sessionID string, content string, attac
 }
 
 func (a *agent) processGeneration(ctx context.Context, sessionID, content string, attachmentParts []message.ContentPart) AgentEvent {
-	cfg := config.Get()
 	// List existing messages; if none, start title generation asynchronously.
 	msgs, err := a.messages.List(ctx, sessionID)
 	if err != nil {
@@ -273,40 +273,138 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	// Append the new user message to the conversation history.
 	msgHistory := append(msgs, userMsg)
 
-	for {
-		// Check for cancellation before each iteration
-		select {
-		case <-ctx.Done():
-			return a.err(ctx.Err())
-		default:
-			// Continue processing
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		return a.err(ctx.Err())
+	default:
+	}
+
+	// PASS 1: Tool selection (non-streaming for proper tool_call detection)
+	// llama-server's grammar-based tool parsing only works reliably with non-streaming requests.
+	// With streaming, tool call XML is sent as content deltas and not parsed into tool_calls.
+	pass1Response, err := a.provider.SendMessages(ctx, msgHistory, a.tools)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return a.err(ErrRequestCancelled)
 		}
-		agentMessage, toolResults, err := a.streamAndHandleEvents(ctx, sessionID, msgHistory)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				agentMessage.AddFinish(message.FinishReasonCanceled)
-				a.messages.Update(context.Background(), agentMessage)
-				return a.err(ErrRequestCancelled)
-			}
-			return a.err(fmt.Errorf("failed to process events: %w", err))
-		}
-		if cfg.Debug {
-			seqId := (len(msgHistory) + 1) / 2
-			toolResultFilepath := logging.WriteToolResultsJson(sessionID, seqId, toolResults)
-			logging.Info("Result", "message", agentMessage.FinishReason(), "toolResults", "{}", "filepath", toolResultFilepath)
-		} else {
-			logging.Info("Result", "message", agentMessage.FinishReason(), "toolResults", toolResults)
-		}
-		if (agentMessage.FinishReason() == message.FinishReasonToolUse) && toolResults != nil {
-			// We are not done, we need to respond with the tool response
-			msgHistory = append(msgHistory, agentMessage, *toolResults)
-			continue
-		}
+		return a.err(fmt.Errorf("failed to send pass 1 messages: %w", err))
+	}
+
+	// Save the pass 1 response as an assistant message
+	agentMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: pass1Response.Content}},
+		Model: a.provider.Model().ID,
+	})
+	if err != nil {
+		return a.err(fmt.Errorf("failed to create pass 1 message: %w", err))
+	}
+	agentMessage.SetToolCalls(pass1Response.ToolCalls)
+	agentMessage.AddFinish(pass1Response.FinishReason)
+	if err := a.messages.Update(ctx, agentMessage); err != nil {
+		return a.err(fmt.Errorf("failed to update pass 1 message: %w", err))
+	}
+
+	logging.Info("Pass 1 result", "finishReason", pass1Response.FinishReason, "toolCalls", len(pass1Response.ToolCalls), "content", pass1Response.Content)
+
+	// If no tool calls, return directly (knowledge question or text-only response)
+	if pass1Response.FinishReason != message.FinishReasonToolUse || len(pass1Response.ToolCalls) == 0 {
 		return AgentEvent{
 			Type:    AgentEventTypeResponse,
 			Message: agentMessage,
 			Done:    true,
 		}
+	}
+
+	// Execute the tool calls — set session/message context required by tools (e.g., bash)
+	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
+	ctx = context.WithValue(ctx, tools.MessageIDContextKey, agentMessage.ID)
+	var toolResults *message.Message
+	for _, tc := range pass1Response.ToolCalls {
+		// Sanitize tool call inputs from local models — the small model sometimes
+		// generates hallucinated text inside parameter values (analysis, fake output, etc.)
+		sanitizedInput := sanitizeToolInput(tc.Name, tc.Input)
+		for _, availableTool := range a.tools {
+			if availableTool.Info().Name == tc.Name {
+				toolCall := tools.ToolCall{
+					ID:    tc.ID,
+					Name:  tc.Name,
+					Input: sanitizedInput,
+				}
+				result, resultErr := availableTool.Run(ctx, toolCall)
+				if resultErr != nil {
+					result = tools.ToolResponse{Content: fmt.Sprintf("Error: %v", resultErr)}
+				}
+				if toolResults == nil {
+					trMsg, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+						Role:  message.Tool,
+						Parts: []message.ContentPart{},
+					})
+					if createErr != nil {
+						return a.err(fmt.Errorf("failed to create tool result message: %w", createErr))
+					}
+					toolResults = &trMsg
+				}
+				toolResults.AddToolResult(message.ToolResult{
+					ToolCallID: tc.ID,
+					Content:    result.Content,
+				})
+				break
+			}
+		}
+	}
+
+	if toolResults != nil {
+		if err := a.messages.Update(ctx, *toolResults); err != nil {
+			return a.err(fmt.Errorf("failed to update tool results: %w", err))
+		}
+	}
+
+	// PASS 2: Diagnostic generation (no tools, fresh context with tool output)
+	// Build a new prompt that includes the original question + tool results.
+	// No tool definitions are sent — forces text-only generation and saves ~4000 tokens.
+	pass2Content := fmt.Sprintf(
+		"%s\n\nI ran `%s` and got:\n```\n%s\n```\nAnalyze these results.",
+		content,
+		toolCallSummary(agentMessage),
+		toolResultContent(toolResults),
+	)
+	pass2Msg, err := a.createUserMessage(ctx, sessionID, pass2Content, nil)
+	if err != nil {
+		return a.err(fmt.Errorf("failed to create pass 2 user message: %w", err))
+	}
+	pass2History := []message.Message{pass2Msg}
+
+	// Pass 2: non-streaming, no tools — forces text-only diagnostic generation
+	pass2Response, err := a.provider.SendMessages(ctx, pass2History, nil)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return a.err(ErrRequestCancelled)
+		}
+		return a.err(fmt.Errorf("failed to generate diagnostic: %w", err))
+	}
+
+	// Truncate repetitive output from small models
+	diagnosticContent := truncateRepetition(pass2Response.Content)
+
+	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: diagnosticContent}},
+		Model: a.provider.Model().ID,
+	})
+	if err != nil {
+		return a.err(fmt.Errorf("failed to create diagnostic message: %w", err))
+	}
+	diagnosticMessage.AddFinish(pass2Response.FinishReason)
+	if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
+		return a.err(fmt.Errorf("failed to update diagnostic message: %w", err))
+	}
+
+	return AgentEvent{
+		Type:    AgentEventTypeResponse,
+		Message: diagnosticMessage,
+		Done:    true,
 	}
 }
 
@@ -435,6 +533,160 @@ out:
 	}
 
 	return assistantMsg, &msg, err
+}
+
+// streamDiagnostic calls the provider with NO tools, forcing text-only generation.
+// This is Pass 2 of the two-pass architecture for small models.
+func (a *agent) streamDiagnostic(ctx context.Context, sessionID string, msgHistory []message.Message) (message.Message, error) {
+	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
+	eventChan := a.provider.StreamResponse(ctx, msgHistory, nil) // NO tools
+
+	assistantMsg, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{},
+		Model: a.provider.Model().ID,
+	})
+	if err != nil {
+		return assistantMsg, fmt.Errorf("failed to create diagnostic message: %w", err)
+	}
+
+	for event := range eventChan {
+		if processErr := a.processEvent(ctx, sessionID, &assistantMsg, event); processErr != nil {
+			a.finishMessage(ctx, &assistantMsg, message.FinishReasonCanceled)
+			return assistantMsg, processErr
+		}
+		if ctx.Err() != nil {
+			a.finishMessage(context.Background(), &assistantMsg, message.FinishReasonCanceled)
+			return assistantMsg, ctx.Err()
+		}
+	}
+
+	return assistantMsg, nil
+}
+
+// truncateRepetition detects when a small model enters a generation loop
+// (repeating the same phrase/paragraph) and truncates the output.
+func truncateRepetition(content string) string {
+	if len(content) < 200 {
+		return content
+	}
+	// Split into sentences/paragraphs and detect repetition
+	lines := strings.Split(content, "\n")
+	seen := make(map[string]int)
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			result = append(result, line)
+			continue
+		}
+		seen[trimmed]++
+		if seen[trimmed] > 2 {
+			// This line has appeared 3+ times — stop here
+			break
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
+}
+
+// sanitizeToolInput cleans up tool call inputs from small local models that sometimes
+// hallucinate extra text inside parameter values. For bash commands, this extracts
+// only the first meaningful line (the actual command) and discards everything else.
+func sanitizeToolInput(toolName, input string) string {
+	if toolName == "bash" {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(input), &parsed); err != nil {
+			return input
+		}
+		cmd, ok := parsed["command"].(string)
+		if !ok || cmd == "" {
+			return input
+		}
+		// Take only the first non-empty line as the command.
+		// The model often generates the actual command on line 1,
+		// then hallucinates analysis/output on subsequent lines.
+		// Note: llama-server may produce literal "\n" text or actual newlines
+		// depending on how the grammar parser serializes the content.
+		cmd = strings.ReplaceAll(cmd, `\n`, "\n") // normalize literal \n to real newlines
+		lines := strings.Split(cmd, "\n")
+		cleanCmd := ""
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// Stop at lines that look like hallucinated output or XML tags
+			if strings.HasPrefix(line, "<") || strings.HasPrefix(line, "**") || strings.HasPrefix(line, "#") {
+				break
+			}
+			cleanCmd = line
+			break
+		}
+		if cleanCmd == "" {
+			return input
+		}
+		parsed["command"] = cleanCmd
+		// Remove any hallucinated extra keys
+		clean := map[string]interface{}{"command": cleanCmd}
+		if timeout, ok := parsed["timeout"]; ok {
+			clean["timeout"] = timeout
+		}
+		result, err := json.Marshal(clean)
+		if err != nil {
+			return input
+		}
+		return string(result)
+	}
+
+	// For view tool, sanitize file_path
+	if toolName == "view" {
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(input), &parsed); err != nil {
+			return input
+		}
+		fp, ok := parsed["file_path"].(string)
+		if !ok {
+			return input
+		}
+		// Take first line only, trim spaces
+		fp = strings.TrimSpace(strings.Split(fp, "\n")[0])
+		clean := map[string]interface{}{"file_path": fp}
+		if offset, ok := parsed["offset"]; ok {
+			clean["offset"] = offset
+		}
+		if limit, ok := parsed["limit"]; ok {
+			clean["limit"] = limit
+		}
+		result, err := json.Marshal(clean)
+		if err != nil {
+			return input
+		}
+		return string(result)
+	}
+
+	return input
+}
+
+// toolCallSummary extracts a human-readable summary of tool calls from a message.
+func toolCallSummary(msg message.Message) string {
+	var parts []string
+	for _, tc := range msg.ToolCalls() {
+		parts = append(parts, fmt.Sprintf("%s(%s)", tc.Name, tc.Input))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// toolResultContent extracts text content from tool results, capped at 2000 chars.
+func toolResultContent(msg *message.Message) string {
+	var content string
+	for _, tr := range msg.ToolResults() {
+		content += tr.Content + "\n"
+	}
+	if len(content) > 2000 {
+		content = content[:2000] + "\n... (truncated)"
+	}
+	return content
 }
 
 func (a *agent) finishMessage(ctx context.Context, msg *message.Message, finishReson message.FinishReason) {

@@ -43,8 +43,18 @@ Thumbs.db
 
 .opencode/
 .termfix/
+.termfix.json
 
 opencode
 opencode.md
 termfix
 termfix-*
+
+# Training intermediate outputs (large model weights, adapters)
+training/output/
+
+# Only include the final production model via LFS, not old cycles
+models/termfix-cycle[1-7]*
+
+# Misc
+disk_usage.txt

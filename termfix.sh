@@ -31,6 +31,10 @@ if [ -n "$MODEL" ] && [ ! -f "$MODEL" ]; then
   echo "ERROR: TERMFIX_MODEL file not found: $MODEL"
   exit 1
 fi
+# Model discovery priority: Qwen 3.5 (newest/best) → Qwen 1.5B (legacy) → any GGUF
+if [ -z "$MODEL" ]; then
+  MODEL=$(ls "$MODEL_DIR"/*qwen3.5* "$MODEL_DIR"/*qwen3_5* 2>/dev/null | head -1 || true)
+fi
 if [ -z "$MODEL" ]; then
   MODEL=$(ls "$MODEL_DIR"/*qwen15b*q4_k_m* 2>/dev/null | head -1 || true)
 fi
@@ -65,12 +69,23 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting llama-server on port $PORT with $(basename "$MODEL")..."
+
+# Build extra flags for Qwen 3.5 models (optimized sampling to prevent thinking loops)
+EXTRA_FLAGS=""
+MODEL_LOWER=$(echo "$(basename "$MODEL")" | tr '[:upper:]' '[:lower:]')
+if echo "$MODEL_LOWER" | grep -qE 'qwen3[._]5'; then
+  EXTRA_FLAGS="--temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.5 --reasoning off --reasoning-format deepseek"
+  echo "Detected Qwen 3.5 model, using optimized sampling params (thinking disabled)"
+fi
+
+# shellcheck disable=SC2086
 "$LLAMA_SERVER" \
   --model "$MODEL" \
-  -c 8192 --flash-attn on \
+  -c 8192 --flash-attn on --jinja \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   --host 127.0.0.1 --port "$PORT" \
   --parallel 1 \
+  $EXTRA_FLAGS \
   >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 

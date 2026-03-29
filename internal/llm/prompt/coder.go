@@ -14,7 +14,7 @@ import (
 )
 
 func CoderPrompt(provider models.ModelProvider) string {
-	envInfo := getEnvironmentInfo()
+	envInfo := getEnvironmentInfo(provider)
 	return fmt.Sprintf("%s\n\n%s", baseTermfixPrompt, envInfo)
 }
 
@@ -37,11 +37,22 @@ Keep responses short — this is a terminal interface.
 
 When /diagnose context is provided with system facts, use those as your starting point rather than re-collecting the same information.`
 
-func getEnvironmentInfo() string {
+func getEnvironmentInfo(provider models.ModelProvider) string {
 	cwd := config.WorkingDirectory()
 	isGit := isGitRepo(cwd)
 	platform := runtime.GOOS
 	date := time.Now().Format("1/2/2006")
+
+	// Skip project listing for local models to save context tokens
+	if provider == models.ProviderLocal {
+		return fmt.Sprintf(`<env>
+Working directory: %s
+Is directory a git repo: %s
+Platform: %s
+Today's date: %s
+</env>`, cwd, boolToYesNo(isGit), platform, date)
+	}
+
 	ls := tools.NewLsTool()
 	r, _ := ls.Run(context.Background(), tools.ToolCall{
 		Input: `{"path":"."}`,
