@@ -47,13 +47,14 @@ Thumbs.db
 
 opencode
 opencode.md
-termfix
-termfix-*
+
+# Built binary (not the source)
+/termfix
 
 # Training intermediate outputs (large model weights, adapters)
 training/output/
 
-# Only include the final production model via LFS, not old cycles
+# Old model cycles (only cycle8 production model tracked via LFS)
 models/termfix-cycle[1-7]*
 
 # Misc

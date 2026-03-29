@@ -1,0 +1,33 @@
+# termfix cycle2 LoRA training config
+# Qwen 3.5 0.8B → sysadmin/networking tool-calling specialist
+#
+# FINDINGS:
+# - max_seq_length=2048 needed (1024 truncates examples → NaN gradients)
+# - num_layers=16 needed (8 layers → NaN from DeltaNet gradient instability)
+# - lr=2e-5 works; 1e-4 too high
+# - Metal buffer limit (499K) crashes at ~iter 60
+# - Strategy: save every 25 iters, collect best checkpoint before crash
+
+model: "Qwen/Qwen3.5-0.8B"
+data: "data"
+train: true
+fine_tune_type: "lora"
+optimizer: "adamw"
+mask_prompt: true
+
+num_layers: 16
+batch_size: 1
+iters: 200
+learning_rate: 2.0e-5
+grad_accumulation_steps: 2
+grad_checkpoint: true
+
+val_batches: -1
+steps_per_report: 10
+steps_per_eval: 25
+save_every: 25
+
+max_seq_length: 2048
+
+adapter_path: "output/adapters"
+seed: 42
