@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,15 @@ var (
 	ErrRequestCancelled = errors.New("request cancelled by user")
 	ErrSessionBusy      = errors.New("session is currently processing another request")
 )
+
+// knowledgePattern matches queries asking for definitions/explanations.
+// These don't need tool calls — the model can answer from training knowledge.
+// Without this, the 0.8B model calls bash for "what is SSH" when tools are available.
+var knowledgePattern = regexp.MustCompile(`(?i)^(what is|what are|what does|explain|define|describe)\b`)
+
+// numericPattern matches numbers with units (e.g., "78%", "22G", "512Mi", "3.8Gi")
+// used to detect fabricated values in model output.
+var numericPattern = regexp.MustCompile(`\d+(?:\.\d+)?%|\d+(?:\.\d+)?[GMKT]i?[Bb]?`)
 
 type AgentEventType string
 
@@ -283,7 +293,14 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	// PASS 1: Tool selection (non-streaming for proper tool_call detection)
 	// llama-server's grammar-based tool parsing only works reliably with non-streaming requests.
 	// With streaming, tool call XML is sent as content deltas and not parsed into tool_calls.
-	pass1Response, err := a.provider.SendMessages(ctx, msgHistory, a.tools)
+	//
+	// Skip tools for knowledge/explanation queries — the 0.8B model incorrectly
+	// calls bash for conceptual questions like "what is SSH" when tools are available.
+	pass1Tools := a.tools
+	if isKnowledgeQuery(content) {
+		pass1Tools = nil
+	}
+	pass1Response, err := a.provider.SendMessages(ctx, msgHistory, pass1Tools)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return a.err(ErrRequestCancelled)
@@ -364,11 +381,12 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	// PASS 2: Diagnostic generation (no tools, fresh context with tool output)
 	// Build a new prompt that includes the original question + tool results.
 	// No tool definitions are sent — forces text-only generation and saves ~4000 tokens.
+	toolOutput := toolResultContent(toolResults)
 	pass2Content := fmt.Sprintf(
 		"%s\n\nI ran `%s` and got:\n```\n%s\n```\nAnalyze these results.",
 		content,
 		toolCallSummary(agentMessage),
-		toolResultContent(toolResults),
+		toolOutput,
 	)
 	pass2Msg, err := a.createUserMessage(ctx, sessionID, pass2Content, nil)
 	if err != nil {
@@ -385,8 +403,9 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 		return a.err(fmt.Errorf("failed to generate diagnostic: %w", err))
 	}
 
-	// Truncate repetitive output from small models
-	diagnosticContent := truncateRepetition(pass2Response.Content)
+	// Truncate repetitive output from small models, then strip lines containing
+	// fabricated numeric values (numbers not present in the original tool output).
+	diagnosticContent := stripFabricatedValues(truncateRepetition(pass2Response.Content), toolOutput)
 
 	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 		Role:  message.Assistant,
@@ -588,6 +607,86 @@ func truncateRepetition(content string) string {
 		result = append(result, line)
 	}
 	return strings.Join(result, "\n")
+}
+
+// isKnowledgeQuery returns true if the user's query is asking for a definition or
+// explanation (e.g., "what is SSH", "explain TCP vs UDP"). These queries should be
+// answered from training knowledge without calling tools.
+func isKnowledgeQuery(content string) bool {
+	return knowledgePattern.MatchString(strings.TrimSpace(content))
+}
+
+// stripFabricatedValues removes lines from the model's response that contain numeric
+// values (with units or %) not found in the original command output. Small models (0.8B)
+// hallucinate completely wrong numbers when analyzing tool output (e.g., "124%" when the
+// output only shows "78%").
+//
+// Leniency rules (to avoid over-stripping):
+//   - Exact match in output numbers → valid
+//   - Bare number (stripped of unit) appears somewhere in output → valid
+//   - Small integers (1-2 digits) → valid (often counts, not data values)
+//
+// If filtering would leave too little content (<50 chars), falls back to raw content.
+func stripFabricatedValues(content, toolOutput string) string {
+	if toolOutput == "" || content == "" {
+		return content
+	}
+
+	// Build set of valid numbers from tool output
+	validNums := make(map[string]bool)
+	for _, n := range numericPattern.FindAllString(toolOutput, -1) {
+		validNums[n] = true
+	}
+	if len(validNums) == 0 {
+		return content // No numbers in output to validate against
+	}
+
+	isFabricated := func(num string) bool {
+		// Exact match
+		if validNums[num] {
+			return false
+		}
+		// Strip unit suffix to get bare number
+		bare := strings.TrimRight(num, "%GMKTiBb")
+		// Small integers (1-2 digits) are OK — represent counts, not data
+		if len(bare) <= 2 {
+			return false
+		}
+		// Bare number appears somewhere in tool output
+		if strings.Contains(toolOutput, bare) {
+			return false
+		}
+		return true
+	}
+
+	// Process content line by line — remove lines with fabricated numbers
+	lines := strings.Split(content, "\n")
+	var result []string
+	for _, line := range lines {
+		numsInLine := numericPattern.FindAllString(line, -1)
+		hasFabricated := false
+		for _, n := range numsInLine {
+			if isFabricated(n) {
+				hasFabricated = true
+				break
+			}
+		}
+		if !hasFabricated {
+			result = append(result, line)
+		}
+	}
+
+	filtered := strings.Join(result, "\n")
+	// If filtering removed too much, redact fabricated numbers inline instead
+	if len(strings.TrimSpace(filtered)) < 50 {
+		return numericPattern.ReplaceAllStringFunc(content, func(match string) string {
+			if isFabricated(match) {
+				return "[?]"
+			}
+			return match
+		})
+	}
+	return filtered
 }
 
 // sanitizeToolInput cleans up tool call inputs from small local models that sometimes
