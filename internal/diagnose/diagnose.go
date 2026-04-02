@@ -12,6 +12,8 @@ const (
 	IssueService     IssueClass = "service"
 	IssueDNS         IssueClass = "dns"
 	IssueNetwork     IssueClass = "network"
+	IssueDocker      IssueClass = "docker"
+	IssueBuild       IssueClass = "build"
 )
 
 func BuildDiagnosePrompt(userError string) string {

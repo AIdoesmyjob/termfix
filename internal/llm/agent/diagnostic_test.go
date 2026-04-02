@@ -964,6 +964,16 @@ func TestParseServiceFailureRecipe_Linux_Unchanged(t *testing.T) {
 	assert.Contains(t, result, "systemctl status")
 }
 
+// --- stripStreamTags ---
+
+func TestStripStreamTags(t *testing.T) {
+	assert.Equal(t, "hello", stripStreamTags("hello"))
+	assert.Equal(t, "output\nerror line", stripStreamTags("output\n<stderr>\nerror line\n</stderr>"))
+	assert.Equal(t, "error line", stripStreamTags("<stderr>\nerror line\n</stderr>"))
+	assert.Equal(t, "just text", stripStreamTags("just text"))
+	assert.Equal(t, "", stripStreamTags(""))
+}
+
 // --- summarizeServiceProbe evidence handlers ---
 
 func TestSummarizeServiceProbe_LogShow(t *testing.T) {
@@ -984,4 +994,185 @@ func TestSummarizeServiceProbe_LaunchctlFailed(t *testing.T) {
 	assert.Contains(t, result, "Failed services")
 	assert.Contains(t, result, "127")
 	assert.Contains(t, result, "com.apple.broken")
+}
+
+// --- Docker crash recipe ---
+
+func TestParseDockerCrashRecipe_OOM(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "my-app",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'my-app'"}`},
+		{Name: "bash", Input: `{"command":"docker logs --tail 40 'my-app' 2>&1"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "exited exit:137 oom:true"},
+		{Content: "2026-04-01 app: processing request\n2026-04-01 app: fatal: out of memory\n2026-04-01 app: killed"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "OOM killed")
+	assert.Contains(t, result, "Critical")
+	assert.Contains(t, result, "memory")
+}
+
+func TestParseDockerCrashRecipe_ExitCode(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "web",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'web'"}`},
+		{Name: "bash", Input: `{"command":"docker logs --tail 40 'web' 2>&1"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "exited exit:1 oom:false"},
+		{Content: "Error: config file not found at /etc/app/config.yml"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "web crashed")
+	assert.Contains(t, result, "not found")
+	assert.Contains(t, result, "High")
+}
+
+func TestParseDockerCrashRecipe_Running(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "redis",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'redis'"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "running exit:0 oom:false"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "running normally")
+	assert.Contains(t, result, "Low")
+}
+
+func TestParseDockerCrashRecipe_ListOnly(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeDockerCrash,
+		IssueClass: diagnose.IssueDocker,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -20"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "NAMES\tSTATUS\tIMAGE\nweb\tExited (1) 2 hours ago\tnginx\nredis\tUp 3 days\tredis:7\nworker\tRestarting (1) 5 seconds ago\tapp:latest"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "containers listed")
+	assert.Contains(t, result, "exited")
+	assert.Contains(t, result, "restarting")
+}
+
+func TestSummarizeDockerProbe(t *testing.T) {
+	result := summarizeDockerProbe("docker logs --tail 40 my-app", "error: connection refused\nfatal: cannot start\nnormal operation")
+	assert.Contains(t, result, "Container log errors")
+	assert.Contains(t, result, "connection refused")
+}
+
+// --- Build failure recipe ---
+
+func TestParseBuildFailureRecipe_Npm(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "npm",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"npm run build 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE unable to resolve dependency tree\nnpm ERR! peer dep conflict: react@18.2.0"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "npm build failed")
+	assert.Contains(t, result, "ERESOLVE")
+	assert.Contains(t, result, "error")
+}
+
+func TestParseBuildFailureRecipe_Go(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "go",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"go build ./... 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "./main.go:15:2: undefined: DoStuff\n./main.go:20:5: imported and not used: \"fmt\""},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "go build failed")
+	assert.Contains(t, result, "undefined")
+}
+
+func TestParseBuildFailureRecipe_Cargo(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "cargo",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"cargo build 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "error[E0308]: mismatched types\n  --> src/main.rs:10:5\nerror[E0425]: cannot find value `x` in this scope\n  --> src/main.rs:15:10"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "cargo build failed")
+	assert.Contains(t, result, "error")
+}
+
+func TestParseBuildFailureRecipe_NoErrors(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "go",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"go build ./... 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: ""},
+	}
+
+	_, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	assert.False(t, ok) // empty output falls through
+}
+
+func TestSummarizeBuildProbe(t *testing.T) {
+	result := summarizeBuildProbe("npm run build", "npm ERR! code ERESOLVE\nnpm ERR! peer dep conflict\nBuilding modules...")
+	assert.Contains(t, result, "build errors")
+	assert.Contains(t, result, "ERESOLVE")
 }

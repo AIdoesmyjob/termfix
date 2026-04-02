@@ -96,6 +96,10 @@ func summarizeProbe(recipe *diagnose.Recipe, command, output string) string {
 		return summarizeNetworkProbe(command, output)
 	case diagnose.RecipeServiceFailure:
 		return summarizeServiceProbe(command, output)
+	case diagnose.RecipeDockerCrash:
+		return summarizeDockerProbe(command, output)
+	case diagnose.RecipeBuildFailure:
+		return summarizeBuildProbe(command, output)
 	default:
 		return ""
 	}
@@ -254,6 +258,44 @@ func summarizeServiceProbe(command, output string) string {
 		if len(lines) > 0 {
 			return "- Service listing:\n" + bulletLines(lines)
 		}
+	}
+	return ""
+}
+
+func summarizeDockerProbe(command, output string) string {
+	if strings.Contains(command, "docker inspect") {
+		lines := firstNonEmptyLines(output, 4)
+		if len(lines) > 0 {
+			return "- Container state:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "docker logs") {
+		interesting := grepLines(output, `(?i)(error|fatal|panic|killed|oom|denied|permission|refused|not found|exception)`)
+		if len(interesting) > 0 {
+			return "- Container log errors:\n" + bulletLines(firstN(interesting, 6))
+		}
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Container logs:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "docker ps") {
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Container listing:\n" + bulletLines(lines)
+		}
+	}
+	return ""
+}
+
+func summarizeBuildProbe(command, output string) string {
+	errorLines := grepLines(output, `(?i)(error|ERR!|ERESOLVE|cannot find|undefined:|syntax error|mismatched types|error\[E|fatal:|failed)`)
+	if len(errorLines) > 0 {
+		return fmt.Sprintf("- %d build errors:\n%s", len(errorLines), bulletLines(firstN(errorLines, 6)))
+	}
+	lines := firstNonEmptyLines(output, 4)
+	if len(lines) > 0 {
+		return "- Build output:\n" + bulletLines(lines)
 	}
 	return ""
 }

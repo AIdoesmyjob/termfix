@@ -16,12 +16,16 @@ func CoderAgentTools(
 	history history.Service,
 	lspClients map[string]*lsp.Client,
 ) []tools.BaseTool {
-	return []tools.BaseTool{
+	t := []tools.BaseTool{
 		tools.NewBashTool(permissions),
 		tools.NewViewTool(nil),
 		tools.NewGlobTool(),
 		tools.NewGrepTool(),
 	}
+	if len(lspClients) > 0 {
+		t = append(t, tools.NewDiagnosticsTool(lspClients))
+	}
+	return t
 }
 
 func TaskAgentTools(lspClients map[string]*lsp.Client) []tools.BaseTool {

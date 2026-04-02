@@ -57,7 +57,7 @@ func tryStructuredDiagnostic(toolCalls []message.ToolCall, toolResults []message
 		return "", false
 	}
 
-	output := toolResults[0].Content
+	output := stripStreamTags(toolResults[0].Content)
 	if toolResults[0].IsError || output == "" || strings.HasPrefix(output, "Error:") {
 		return "", false
 	}
@@ -102,6 +102,14 @@ func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.
 		return "", false
 	}
 
+	// Strip stderr tags from all tool results before parsing
+	cleaned := make([]message.ToolResult, len(toolResults))
+	for i, tr := range toolResults {
+		cleaned[i] = tr
+		cleaned[i].Content = stripStreamTags(tr.Content)
+	}
+	toolResults = cleaned
+
 	switch recipe.Name {
 	case diagnose.RecipeServiceFailure:
 		return parseServiceFailureRecipe(recipe, toolCalls, toolResults)
@@ -115,9 +123,22 @@ func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.
 		return parseMemoryPressureRecipe(recipe, toolCalls, toolResults)
 	case diagnose.RecipePerformanceCPU:
 		return parsePerformanceCPURecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDockerCrash:
+		return parseDockerCrashRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeBuildFailure:
+		return parseBuildFailureRecipe(recipe, toolCalls, toolResults)
 	default:
 		return "", false
 	}
+}
+
+// stripStreamTags removes <stderr>...</stderr> wrapper tags from tool output.
+func stripStreamTags(output string) string {
+	output = strings.ReplaceAll(output, "<stderr>\n", "")
+	output = strings.ReplaceAll(output, "\n</stderr>", "")
+	output = strings.ReplaceAll(output, "<stderr>", "")
+	output = strings.ReplaceAll(output, "</stderr>", "")
+	return output
 }
 
 // extractCommand parses the JSON input of a bash tool call to get the command string.
@@ -1617,5 +1638,227 @@ func parseEtcFile(command, output string) (string, bool) {
 			break
 		}
 	}
+	return d.Render(), true
+}
+
+// parseDockerCrashRecipe handles docker inspect + docker logs output.
+func parseDockerCrashRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	containerName := recipe.ServiceName
+	if containerName == "" {
+		containerName = "container"
+	}
+
+	firstOutput := strings.TrimSpace(toolResults[0].Content)
+	if firstOutput == "" {
+		return "", false
+	}
+
+	// Case A: docker ps -a listing (no specific container)
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.Contains(cmd, "docker ps") {
+		return parseDockerListing(firstOutput)
+	}
+
+	// Case B: docker inspect output
+	oom := strings.Contains(firstOutput, "oom:true") || strings.Contains(firstOutput, "OOMKilled:true")
+	exitCodeRe := regexp.MustCompile(`exit:(\d+)`)
+	exitCodeStr := "0"
+	exitCode := 0
+	if m := exitCodeRe.FindStringSubmatch(firstOutput); len(m) == 2 {
+		exitCodeStr = m[1]
+		exitCode, _ = strconv.Atoi(m[1])
+	}
+	status := ""
+	if fields := strings.Fields(firstOutput); len(fields) > 0 {
+		status = fields[0]
+	}
+
+	// Collect log errors if we have a second result
+	var logErrors []string
+	if len(toolResults) >= 2 {
+		logOutput := strings.TrimSpace(toolResults[1].Content)
+		logErrors = grepLines(logOutput, `(?i)(error|fatal|panic|killed|oom|denied|permission|refused|not found|exception)`)
+	}
+
+	// Container is running
+	if status == "running" && exitCode == 0 && !oom {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s is running normally", containerName),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("Status: %s, exit code: %s", status, exitCodeStr))
+		if len(logErrors) > 0 {
+			for _, line := range firstN(logErrors, 4) {
+				d.Findings = append(d.Findings, line)
+			}
+			d.Remediation = append(d.Remediation, "Container is running but logs contain errors — monitor for recurrence")
+		}
+		return d.Render(), true
+	}
+
+	// Determine root cause
+	rootCause := "container crash"
+	risk := "High"
+	if oom {
+		rootCause = "OOM killed — container exceeded memory limit"
+		risk = "Critical"
+	} else if exitCode == 137 {
+		rootCause = "killed by SIGKILL (exit 137) — likely OOM or manual kill"
+		risk = "Critical"
+	} else if exitCode == 1 {
+		rootCause = "application error (exit 1)"
+		if len(logErrors) > 0 {
+			for _, line := range logErrors {
+				lower := strings.ToLower(line)
+				if strings.Contains(lower, "not found") {
+					rootCause = "missing dependency or file (exit 1)"
+					break
+				}
+				if strings.Contains(lower, "permission") || strings.Contains(lower, "denied") {
+					rootCause = "permission error (exit 1)"
+					risk = "Critical"
+					break
+				}
+			}
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s crashed: %s", containerName, rootCause),
+		RiskLevel: risk,
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("Status: %s, exit code: %s, OOMKilled: %v", status, exitCodeStr, oom))
+	for _, line := range firstN(logErrors, 6) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	if oom || exitCode == 137 {
+		d.Remediation = append(d.Remediation, "Increase container memory limit or optimize application memory usage")
+	} else {
+		d.Remediation = append(d.Remediation, "Review container logs and fix the application error before restarting")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Restart with: `docker restart %s`", containerName))
+	return d.Render(), true
+}
+
+// parseDockerListing handles docker ps -a listing output when no specific container is targeted.
+func parseDockerListing(output string) (string, bool) {
+	lines := firstNonEmptyLines(output, 30)
+	if len(lines) <= 1 {
+		return "", false
+	}
+
+	exited := grepLines(output, `(?i)exited`)
+	restarting := grepLines(output, `(?i)restarting`)
+
+	risk := "Low"
+	summary := fmt.Sprintf("%d containers listed", len(lines)-1)
+	if len(exited) > 0 || len(restarting) > 0 {
+		risk = "Medium"
+		summary = fmt.Sprintf("%d containers listed, %d exited, %d restarting",
+			len(lines)-1, len(exited), len(restarting))
+	}
+	if len(restarting) > 0 {
+		risk = "High"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(lines, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(exited)+len(restarting) > 0 {
+		d.Remediation = append(d.Remediation, "Inspect crashed containers: `docker inspect <name>` and `docker logs <name>`")
+	}
+	return d.Render(), true
+}
+
+// parseBuildFailureRecipe handles build tool output (npm, go, cargo, etc.).
+func parseBuildFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	output := strings.TrimSpace(toolResults[0].Content)
+	if output == "" {
+		return "", false
+	}
+
+	buildTool := recipe.ServiceName
+	if buildTool == "" {
+		buildTool = "build"
+	}
+
+	// Check if this was the auto-detect command (ls for manifest files)
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.HasPrefix(cmd, "ls ") {
+		return parseBuildAutoDetect(output)
+	}
+
+	// Look for error lines
+	errorLines := grepLines(output, `(?i)(error|ERR!|ERESOLVE|cannot find|undefined:|imported and not used|syntax error|mismatched types|error\[E|fatal:|undefined reference|failed)`)
+
+	if len(errorLines) == 0 {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s build completed successfully", buildTool),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, "No error patterns found in build output")
+		snippet := firstNonEmptyLines(output, 4)
+		for _, line := range snippet {
+			d.Findings = append(d.Findings, line)
+		}
+		return d.Render(), true
+	}
+
+	risk := "Medium"
+	if len(errorLines) >= 5 {
+		risk = "High"
+	}
+	if len(errorLines) >= 10 {
+		risk = "Critical"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s build failed with %d error(s)", buildTool, len(errorLines)),
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(errorLines, 8) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(errorLines) > 8 {
+		d.Findings = append(d.Findings, fmt.Sprintf("... and %d more errors", len(errorLines)-8))
+	}
+	d.Remediation = append(d.Remediation, "Fix the errors listed above and re-run the build")
+	return d.Render(), true
+}
+
+// parseBuildAutoDetect handles `ls package.json Cargo.toml ...` output for build tool detection.
+func parseBuildAutoDetect(output string) (string, bool) {
+	files := firstNonEmptyLines(output, 10)
+	if len(files) == 0 {
+		d := DiagnosticResult{
+			Summary:   "No build manifest files found in current directory",
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, "No package.json, Cargo.toml, go.mod, or Makefile detected")
+		d.Remediation = append(d.Remediation, "Ensure you are in the correct project directory")
+		return d.Render(), true
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("Detected %d build manifest(s)", len(files)),
+		RiskLevel: "Low",
+	}
+	for _, f := range files {
+		d.Findings = append(d.Findings, f)
+	}
+	d.Remediation = append(d.Remediation, "Run the build command for the detected project type")
 	return d.Render(), true
 }

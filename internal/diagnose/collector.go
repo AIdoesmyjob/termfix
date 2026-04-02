@@ -66,6 +66,10 @@ func ClassifyIssue(userError string) IssueClass {
 		return IssueDNS
 	case containsAny(normalized, "network", "internet", "wifi", "ethernet", "latency", "packet", "routing", "route", "connectivity", "offline"):
 		return IssueNetwork
+	case containsAny(normalized, "docker", "container", "image", "dockerfile", "compose", "pod"):
+		return IssueDocker
+	case containsAny(normalized, "build", "compile", "npm", "yarn", "pnpm", "cargo", "go build", "make", "webpack", "vite", "tsc", "typescript"):
+		return IssueBuild
 	case containsAny(normalized, "service", "daemon", "systemd", "launchd", "failed to start", "won't start", "wont start", "crash", "restarting"):
 		return IssueService
 	default:
@@ -112,6 +116,17 @@ func planFactsForIssue(issueClass IssueClass) []factCollector {
 			{Title: "Interfaces", Run: collectInterfaceFacts},
 			{Title: "Routes", Run: collectRouteFacts},
 			{Title: "DNS Configuration", Run: collectDNSFacts},
+		}
+	case IssueDocker:
+		return []factCollector{
+			{Title: "Docker Info", Run: func() string { return runCmd("docker", "info", "--format", "{{.ServerVersion}}") }},
+			{Title: "Containers", Run: func() string {
+				return runCmd("docker", "ps", "-a", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}")
+			}},
+		}
+	case IssueBuild:
+		return []factCollector{
+			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
 		}
 	case IssueService:
 		return []factCollector{
@@ -297,6 +312,33 @@ var serviceNameFallbackRe = regexp.MustCompile(`\b([a-z][a-z0-9_-]{1,30})\s+(?:s
 var falsePositiveServices = map[string]bool{
 	"the": true, "my": true, "this": true, "a": true,
 	"an": true, "our": true, "your": true,
+}
+
+var containerNameRe = regexp.MustCompile(`\b(?:container|docker)\s+(?:run|start|stop|restart|logs|inspect|exec)\s+([a-z][a-z0-9_.-]{1,63})\b`)
+
+var falsePositiveContainerNames = map[string]bool{
+	"the": true, "my": true, "this": true, "a": true,
+	"an": true, "our": true, "your": true,
+	"is": true, "are": true, "was": true, "not": true,
+	"up": true, "down": true, "and": true, "or": true,
+}
+
+func ExtractContainerName(value string) string {
+	match := containerNameRe.FindStringSubmatch(value)
+	if len(match) >= 2 && !falsePositiveContainerNames[match[1]] {
+		return match[1]
+	}
+	return ""
+}
+
+var buildToolRe = regexp.MustCompile(`\b(npm|yarn|pnpm|cargo|go|make|cmake|gradle|maven|mvn|webpack|vite|tsc|rustc|gcc|g\+\+|clang)\b`)
+
+func ExtractBuildTool(value string) string {
+	match := buildToolRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
 }
 
 func ExtractServiceName(value string) string {

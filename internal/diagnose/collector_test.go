@@ -57,6 +57,57 @@ func TestExtractServiceName_Expanded(t *testing.T) {
 	assert.Equal(t, "consul", ExtractServiceName("consul agent not joining"))
 }
 
+func TestClassifyIssue_Docker(t *testing.T) {
+	tests := []struct {
+		input string
+		want  IssueClass
+	}{
+		{input: "docker container crashed", want: IssueDocker},
+		{input: "my container won't start", want: IssueDocker},
+		{input: "dockerfile build failing", want: IssueDocker},
+		{input: "compose services are down", want: IssueDocker},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			assert.Equal(t, tt.want, ClassifyIssue(tt.input))
+		})
+	}
+}
+
+func TestClassifyIssue_Build(t *testing.T) {
+	tests := []struct {
+		input string
+		want  IssueClass
+	}{
+		{input: "npm install failing", want: IssueBuild},
+		{input: "cargo build errors", want: IssueBuild},
+		{input: "go build not working", want: IssueBuild},
+		{input: "webpack build fails", want: IssueBuild},
+		{input: "tsc compilation errors", want: IssueBuild},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			assert.Equal(t, tt.want, ClassifyIssue(tt.input))
+		})
+	}
+}
+
+func TestExtractContainerName(t *testing.T) {
+	assert.Equal(t, "my-app", ExtractContainerName("docker logs my-app"))
+	assert.Equal(t, "web-server", ExtractContainerName("container restart web-server"))
+	assert.Equal(t, "redis", ExtractContainerName("docker inspect redis"))
+	assert.Equal(t, "", ExtractContainerName("docker is slow"))
+}
+
+func TestExtractBuildTool(t *testing.T) {
+	assert.Equal(t, "npm", ExtractBuildTool("npm install failing"))
+	assert.Equal(t, "cargo", ExtractBuildTool("cargo build errors"))
+	assert.Equal(t, "go", ExtractBuildTool("go build not working"))
+	assert.Equal(t, "webpack", ExtractBuildTool("webpack build fails"))
+	assert.Equal(t, "tsc", ExtractBuildTool("tsc compilation errors"))
+	assert.Equal(t, "", ExtractBuildTool("the server is slow"))
+}
+
 func TestExtractServiceName_Fallback(t *testing.T) {
 	// Unknown service name matched by fallback pattern
 	assert.Equal(t, "myapp", ExtractServiceName("myapp service won't start"))

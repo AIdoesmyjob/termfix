@@ -293,37 +293,43 @@ func (b *bashTool) Run(ctx context.Context, call ToolCall) (ToolResponse, error)
 	stdout = truncateOutput(stdout)
 	stderr = truncateOutput(stderr)
 
-	errorMessage := stderr
-	if interrupted {
-		if errorMessage != "" {
-			errorMessage += "\n"
-		}
-		errorMessage += "Command was aborted before completion"
-	} else if exitCode != 0 {
-		if errorMessage != "" {
-			errorMessage += "\n"
-		}
-		errorMessage += fmt.Sprintf("Exit code %d", exitCode)
-	}
-
-	hasBothOutputs := stdout != "" && stderr != ""
-
-	if hasBothOutputs {
-		stdout += "\n"
-	}
-
-	if errorMessage != "" {
-		stdout += "\n" + errorMessage
-	}
+	output := formatBashOutput(stdout, stderr, exitCode, interrupted)
 
 	metadata := BashResponseMetadata{
 		StartTime: startTime.UnixMilli(),
 		EndTime:   time.Now().UnixMilli(),
 	}
-	if stdout == "" {
+	if output == "" {
 		return WithResponseMetadata(NewTextResponse("no output"), metadata), nil
 	}
-	return WithResponseMetadata(NewTextResponse(stdout), metadata), nil
+	return WithResponseMetadata(NewTextResponse(output), metadata), nil
+}
+
+func formatBashOutput(stdout, stderr string, exitCode int, interrupted bool) string {
+	var b strings.Builder
+	if stdout != "" {
+		b.WriteString(stdout)
+	}
+	if stderr != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("<stderr>\n")
+		b.WriteString(stderr)
+		b.WriteString("\n</stderr>")
+	}
+	if interrupted {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("Command was aborted before completion")
+	} else if exitCode != 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(fmt.Sprintf("Exit code %d", exitCode))
+	}
+	return b.String()
 }
 
 func truncateOutput(content string) string {

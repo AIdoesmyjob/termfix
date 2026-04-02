@@ -17,6 +17,8 @@ const (
 	RecipeDNSResolution       RecipeName = "dns_resolution"
 	RecipeNetworkConnectivity RecipeName = "network_connectivity"
 	RecipeServiceFailure      RecipeName = "service_failure"
+	RecipeDockerCrash         RecipeName = "docker_crash"
+	RecipeBuildFailure        RecipeName = "build_failure"
 )
 
 type Recipe struct {
@@ -77,6 +79,27 @@ func SelectRecipe(userInput string) *Recipe {
 			IssueClass:     issueClass,
 			InitialCommand: cmd,
 		}
+	case IssueDocker:
+		containerName := ExtractContainerName(strings.ToLower(userInput))
+		cmd := "docker ps -a --format 'table {{.Names}}\\t{{.Status}}\\t{{.Image}}' | head -20"
+		if containerName != "" {
+			cmd = fmt.Sprintf("docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' %s", shellEscapeToken(containerName))
+		}
+		return &Recipe{
+			Name:           RecipeDockerCrash,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+			ServiceName:    containerName,
+		}
+	case IssueBuild:
+		buildTool := ExtractBuildTool(strings.ToLower(userInput))
+		cmd := buildCommandForTool(buildTool)
+		return &Recipe{
+			Name:           RecipeBuildFailure,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+			ServiceName:    buildTool,
+		}
 	case IssueService:
 		cmd := "systemctl --failed --no-pager --plain"
 		if runtime.GOOS == "darwin" {
@@ -134,6 +157,13 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 			return "netstat -rn"
 		}
 		return "ip route"
+	case RecipeDockerCrash:
+		if r.ServiceName == "" {
+			return ""
+		}
+		return fmt.Sprintf("docker logs --tail 40 %s 2>&1", shellEscapeToken(r.ServiceName))
+	case RecipeBuildFailure:
+		return ""
 	case RecipeServiceFailure:
 		if r.ServiceName == "" {
 			return ""
@@ -167,6 +197,27 @@ func hasHighDiskUsage(output string) bool {
 
 func shellEscapeToken(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func buildCommandForTool(tool string) string {
+	switch tool {
+	case "npm":
+		return "npm run build 2>&1 | tail -40"
+	case "yarn":
+		return "yarn build 2>&1 | tail -40"
+	case "pnpm":
+		return "pnpm run build 2>&1 | tail -40"
+	case "cargo":
+		return "cargo build 2>&1 | tail -40"
+	case "go":
+		return "go build ./... 2>&1 | tail -40"
+	case "make":
+		return "make 2>&1 | tail -40"
+	case "tsc":
+		return "tsc --noEmit 2>&1 | tail -40"
+	default:
+		return "ls package.json Cargo.toml go.mod Makefile 2>/dev/null"
+	}
 }
 
 func looksLikeKnowledgeQuery(input string) bool {
