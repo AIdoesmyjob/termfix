@@ -229,7 +229,27 @@ func summarizeServiceProbe(command, output string) string {
 			return "- Recent service logs:\n" + bulletLines(lines)
 		}
 	}
-	if strings.Contains(command, "systemctl --failed") || strings.Contains(command, "launchctl list") {
+	if strings.Contains(command, "log show") {
+		interesting := grepLines(output, `(?i)(error|failed|fatal|panic|denied|permission|address already in use|exception)`)
+		if len(interesting) > 0 {
+			return "- Recent service errors:\n" + bulletLines(firstN(interesting, 6))
+		}
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Recent service logs:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "launchctl list") {
+		failed := grepLines(output, `^\s*(-|\d+)\s+(-[0-9]|[1-9])`)
+		if len(failed) > 0 {
+			return "- Failed services:\n" + bulletLines(firstN(failed, 5))
+		}
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Service listing:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "systemctl --failed") {
 		lines := firstNonEmptyLines(output, 6)
 		if len(lines) > 0 {
 			return "- Service listing:\n" + bulletLines(lines)

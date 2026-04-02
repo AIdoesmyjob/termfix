@@ -174,6 +174,19 @@ func detectCommandKey(command string) string {
 }
 
 func parseServiceFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	// Detect platform from the command in the first tool call.
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.Contains(cmd, "launchctl") {
+		return parseMacServiceFailure(recipe, toolCalls, toolResults)
+	}
+	return parseLinuxServiceFailure(recipe, toolCalls, toolResults)
+}
+
+func parseLinuxServiceFailure(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
 	if len(toolCalls) < 2 || len(toolResults) < 2 {
 		return "", false
 	}
@@ -193,23 +206,7 @@ func parseServiceFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.Tool
 	if serviceName == "" {
 		serviceName = "service"
 	}
-	rootCause := "service failure"
-	for _, line := range errorLines {
-		lower := strings.ToLower(line)
-		switch {
-		case strings.Contains(lower, "address already in use"):
-			rootCause = "port conflict"
-		case strings.Contains(lower, "permission denied") || strings.Contains(lower, "denied"):
-			rootCause = "permission error"
-		case strings.Contains(lower, "not found"):
-			rootCause = "missing dependency or file"
-		case strings.Contains(lower, "invalid"):
-			rootCause = "invalid configuration"
-		}
-		if rootCause != "service failure" {
-			break
-		}
-	}
+	rootCause := detectRootCause(errorLines)
 
 	risk := "High"
 	if rootCause == "port conflict" || rootCause == "permission error" {
@@ -239,6 +236,154 @@ func parseServiceFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.Tool
 	}
 	d.Remediation = append(d.Remediation, fmt.Sprintf("Re-run `systemctl status %s --no-pager --full -n 20` after applying the fix", serviceName))
 	return d.Render(), true
+}
+
+func parseMacServiceFailure(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	serviceName := recipe.ServiceName
+	if serviceName == "" {
+		serviceName = "service"
+	}
+
+	// Case A — 1 result: launchctl list (no specific service name)
+	if len(toolResults) == 1 {
+		return parseMacServiceList(serviceName, toolResults[0].Content)
+	}
+
+	// Case B — 2 results: launchctl list | grep + log show
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	grepOutput := toolResults[0].Content
+	logOutput := toolResults[1].Content
+	if strings.TrimSpace(grepOutput) == "" {
+		return "", false
+	}
+
+	entries := parseLaunchctlList(grepOutput)
+
+	// Determine service state from launchctl grep
+	var pid string
+	var exitCode int
+	if len(entries) > 0 {
+		pid = entries[0].PID
+		exitCode = entries[0].ExitCode
+	}
+
+	// Parse log output for errors
+	errorLines := grepLines(logOutput, `(?i)(error|failed|fatal|panic|denied|permission|address already in use|exception|invalid|not found|refused)`)
+	rootCause := detectRootCause(errorLines)
+
+	// Service is running (has a PID and zero exit code)
+	if pid != "-" && pid != "" && exitCode == 0 {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s is running (PID %s)", serviceName, pid),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("PID: %s, exit code: %d", pid, exitCode))
+		if len(errorLines) > 0 {
+			for _, line := range firstN(errorLines, 4) {
+				d.Findings = append(d.Findings, line)
+			}
+			d.Remediation = append(d.Remediation, "Service is running but recent logs contain errors — monitor for recurrence")
+		}
+		return d.Render(), true
+	}
+
+	// Service is not running or has non-zero exit
+	risk := "High"
+	if rootCause == "port conflict" || rootCause == "permission error" {
+		risk = "Critical"
+	}
+
+	summary := fmt.Sprintf("%s is not running (exit code %d)", serviceName, exitCode)
+	if rootCause != "service failure" {
+		summary = fmt.Sprintf("%s is failing to start due to %s", serviceName, rootCause)
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("PID: %s, exit code: %d", pid, exitCode))
+	for _, line := range firstN(errorLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	switch rootCause {
+	case "port conflict":
+		d.Remediation = append(d.Remediation, "Find the conflicting listener and free the port before restarting the service")
+	case "permission error":
+		d.Remediation = append(d.Remediation, "Fix the file, directory, or capability permissions the service needs at startup")
+	case "invalid configuration":
+		d.Remediation = append(d.Remediation, "Validate and correct the service configuration before restarting")
+	default:
+		d.Remediation = append(d.Remediation, "Review the recent service errors and fix the failing dependency or configuration")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Re-run `launchctl list | grep -i %s` after applying the fix", serviceName))
+	return d.Render(), true
+}
+
+// parseMacServiceList handles the case where launchctl list output (no specific service)
+// is the only tool result. Scans for services with non-zero exit codes.
+func parseMacServiceList(serviceName, output string) (string, bool) {
+	if strings.TrimSpace(output) == "" {
+		return "", false
+	}
+
+	entries := parseLaunchctlList(output)
+	if len(entries) == 0 {
+		return "", false
+	}
+
+	var failed []launchctlEntry
+	for _, e := range entries {
+		if e.ExitCode != 0 {
+			failed = append(failed, e)
+		}
+	}
+
+	if len(failed) == 0 {
+		d := DiagnosticResult{
+			Summary:   "All listed services running normally",
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("%d services checked, all with exit code 0", len(entries)))
+		return d.Render(), true
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%d service(s) with non-zero exit codes", len(failed)),
+		RiskLevel: "High",
+	}
+	for _, e := range firstN(failed, 8) {
+		d.Findings = append(d.Findings, fmt.Sprintf("%s — exit code %d (PID: %s)", e.Label, e.ExitCode, e.PID))
+	}
+	d.Remediation = append(d.Remediation, "Investigate failed services with `launchctl list | grep -i <service>` and check logs with `log show`")
+	return d.Render(), true
+}
+
+// detectRootCause scans error lines for common failure keywords and returns
+// a human-readable root cause string.
+func detectRootCause(errorLines []string) string {
+	rootCause := "service failure"
+	for _, line := range errorLines {
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "address already in use"):
+			rootCause = "port conflict"
+		case strings.Contains(lower, "permission denied") || strings.Contains(lower, "denied"):
+			rootCause = "permission error"
+		case strings.Contains(lower, "not found"):
+			rootCause = "missing dependency or file"
+		case strings.Contains(lower, "invalid"):
+			rootCause = "invalid configuration"
+		}
+		if rootCause != "service failure" {
+			break
+		}
+	}
+	return rootCause
 }
 
 func parseDNSRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
@@ -432,6 +577,42 @@ func parsePerformanceCPURecipe(recipe *diagnose.Recipe, toolCalls []message.Tool
 		b.WriteString("- " + line + "\n")
 	}
 	return b.String(), true
+}
+
+// launchctlLine matches launchctl list columnar output: PID(or "-")  ExitCode(may be negative)  Label
+var launchctlLine = regexp.MustCompile(`^\s*(-|\d+)\s+(-?\d+)\s+(\S.+)$`)
+
+type launchctlEntry struct {
+	PID      string
+	ExitCode int
+	Label    string
+}
+
+// parseLaunchctlList parses launchctl list columnar output and returns entries
+// with non-zero exit codes (i.e. failed services).
+func parseLaunchctlList(output string) []launchctlEntry {
+	var entries []launchctlEntry
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// Skip header line
+		if strings.HasPrefix(trimmed, "PID") {
+			continue
+		}
+		m := launchctlLine.FindStringSubmatch(trimmed)
+		if m == nil {
+			continue
+		}
+		exitCode, _ := strconv.Atoi(m[2])
+		entries = append(entries, launchctlEntry{
+			PID:      m[1],
+			ExitCode: exitCode,
+			Label:    strings.TrimSpace(m[3]),
+		})
+	}
+	return entries
 }
 
 var sizePattern = regexp.MustCompile(`^\d+(\.\d+)?[BKMGTP]?i?$`)

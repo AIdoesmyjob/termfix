@@ -830,3 +830,158 @@ root         1  0.0  0.0 169328 13156 ?        Ss   Mar05   0:09 /sbin/init`
 			"processes should be sorted by CPU descending: %v", cpuValues)
 	}
 }
+
+// --- launchctl list parsing ---
+
+const launchctlListOutput = "PID\tStatus\tLabel\n389\t0\tcom.apple.runningsvr\n-\t127\tcom.apple.failedsvr\n12345\t0\tcom.apple.another"
+
+func TestParseLaunchctlList(t *testing.T) {
+	entries := parseLaunchctlList(launchctlListOutput)
+	require.Len(t, entries, 3)
+
+	assert.Equal(t, "389", entries[0].PID)
+	assert.Equal(t, 0, entries[0].ExitCode)
+	assert.Equal(t, "com.apple.runningsvr", entries[0].Label)
+
+	assert.Equal(t, "-", entries[1].PID)
+	assert.Equal(t, 127, entries[1].ExitCode)
+	assert.Equal(t, "com.apple.failedsvr", entries[1].Label)
+
+	assert.Equal(t, "12345", entries[2].PID)
+	assert.Equal(t, 0, entries[2].ExitCode)
+	assert.Equal(t, "com.apple.another", entries[2].Label)
+}
+
+func TestParseLaunchctlList_AllRunning(t *testing.T) {
+	input := "PID\tStatus\tLabel\n389\t0\tcom.apple.svc1\n456\t0\tcom.apple.svc2"
+	entries := parseLaunchctlList(input)
+	require.Len(t, entries, 2)
+	for _, e := range entries {
+		assert.Equal(t, 0, e.ExitCode)
+	}
+}
+
+func TestParseLaunchctlList_Empty(t *testing.T) {
+	// Header only
+	entries := parseLaunchctlList("PID\tStatus\tLabel\n")
+	assert.Empty(t, entries)
+}
+
+// --- macOS service failure recipe ---
+
+const launchctlGrepOutput = "-\t78\tcom.example.myapp"
+
+const logShowOutput = `2026-04-01 14:23:45.123 myapp[123]: error: failed to bind port 8080
+2026-04-01 14:23:46.234 myapp[123]: fatal: address already in use
+2026-04-01 14:23:47.345 myapp[123]: shutting down`
+
+func TestParseServiceFailureRecipe_MacOS_WithLogs(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeServiceFailure,
+		IssueClass:  diagnose.IssueService,
+		ServiceName: "myapp",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | grep -i 'myapp'"}`},
+		{Name: "bash", Input: `{"command":"log show --predicate 'process == \"myapp\"' --last 5m --style compact 2>/dev/null | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: launchctlGrepOutput},
+		{Content: logShowOutput},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "port conflict")
+	assert.Contains(t, result, "address already in use")
+	assert.Contains(t, result, "Critical")
+	assert.Contains(t, result, "launchctl list | grep -i myapp")
+}
+
+func TestParseServiceFailureRecipe_MacOS_ListOnly(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeServiceFailure,
+		IssueClass: diagnose.IssueService,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | head -50"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: launchctlListOutput},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "non-zero exit codes")
+	assert.Contains(t, result, "com.apple.failedsvr")
+	assert.Contains(t, result, "exit code 127")
+	assert.Contains(t, result, "High")
+}
+
+func TestParseServiceFailureRecipe_MacOS_Running(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeServiceFailure,
+		IssueClass:  diagnose.IssueService,
+		ServiceName: "myapp",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | grep -i 'myapp'"}`},
+		{Name: "bash", Input: `{"command":"log show --predicate 'process == \"myapp\"' --last 5m --style compact 2>/dev/null | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "12345\t0\tcom.example.myapp"},
+		{Content: "2026-04-01 14:23:47.345 myapp[123]: normal operation"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "is running")
+	assert.Contains(t, result, "PID 12345")
+	assert.Contains(t, result, "Low")
+}
+
+func TestParseServiceFailureRecipe_Linux_Unchanged(t *testing.T) {
+	// Regression guard: existing Linux flow must still work identically.
+	recipe := diagnose.SelectRecipe("nginx won't start")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"systemctl status nginx --no-pager --full -n 20"}`},
+		{Name: "bash", Input: `{"command":"journalctl -u nginx -n 40 --no-pager"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "Loaded: loaded (/usr/lib/systemd/system/nginx.service)\nActive: failed (Result: exit-code)\nMain PID: 1234 (code=exited, status=1/FAILURE)"},
+		{Content: "Apr 01 nginx[1234]: bind() to 0.0.0.0:80 failed (98: Address already in use)\nApr 01 systemd[1]: nginx.service: Failed with result 'exit-code'."},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "nginx is failing to start due to port conflict")
+	assert.Contains(t, result, "Address already in use")
+	assert.Contains(t, result, "systemctl status")
+}
+
+// --- summarizeServiceProbe evidence handlers ---
+
+func TestSummarizeServiceProbe_LogShow(t *testing.T) {
+	cmd := `log show --predicate 'process == "myapp"' --last 5m --style compact`
+	output := "2026-04-01 14:23:45 myapp[123]: error: something broke\n2026-04-01 14:23:46 myapp[123]: fatal: address already in use\n2026-04-01 14:23:47 myapp[123]: normal line"
+
+	result := summarizeServiceProbe(cmd, output)
+	assert.Contains(t, result, "Recent service errors")
+	assert.Contains(t, result, "error: something broke")
+	assert.Contains(t, result, "address already in use")
+}
+
+func TestSummarizeServiceProbe_LaunchctlFailed(t *testing.T) {
+	cmd := "launchctl list | head -50"
+	output := "PID\tStatus\tLabel\n389\t0\tcom.apple.ok\n-\t127\tcom.apple.broken\n-\t78\tcom.example.dead"
+
+	result := summarizeServiceProbe(cmd, output)
+	assert.Contains(t, result, "Failed services")
+	assert.Contains(t, result, "127")
+	assert.Contains(t, result, "com.apple.broken")
+}
