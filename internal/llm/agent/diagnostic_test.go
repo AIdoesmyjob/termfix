@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -665,4 +666,167 @@ func TestTryStructuredDiagnostic_FreeRoundtrip(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, result, "**Summary**")
 	assert.Contains(t, result, "RAM:")
+}
+
+// --- Edge case tests ---
+
+func TestParseDiskUsage_SpacesInFilesystem(t *testing.T) {
+	// LVM or device-mapper names with many fields before the percentage
+	input := `Filesystem                        Size  Used Avail Use% Mounted on
+/dev/mapper/vg--data-lv--app      200G  180G   20G  90% /opt/app
+tmpfs                             7.8G     0  7.8G   0% /dev/shm`
+	result, ok := parseDiskUsage(input)
+	require.True(t, ok)
+	assert.Contains(t, result, "90%")
+	assert.Contains(t, result, "/opt/app")
+}
+
+func TestParseDiskUsage_Truncated(t *testing.T) {
+	// Only header, no data rows
+	input := `Filesystem      Size  Used Avail Use% Mounted on`
+	_, ok := parseDiskUsage(input)
+	assert.False(t, ok)
+}
+
+func TestParseMemory_TruncatedOnlyHeader(t *testing.T) {
+	input := `               total        used        free      shared  buff/cache   available`
+	_, ok := parseMemory(input)
+	assert.False(t, ok)
+}
+
+func TestParseTop_TruncatedFewLines(t *testing.T) {
+	// Fewer than 5 lines — Linux parser should reject
+	input := `top - 10:00:00 up 1 day
+Tasks: 100 total
+%Cpu(s):  5.0 us`
+	_, ok := parseTop(input)
+	assert.False(t, ok)
+}
+
+const macTopOutput = `Processes: 879 total, 4 running, 875 sleeping, 3204 threads                                           14:23:05
+Load Avg: 2.93, 3.78, 3.89  CPU usage: 7.10% user, 8.80% sys, 84.18% idle
+SharedLibs: 894M resident, 134M data, 79M linkedit.
+MemRegions: 567890 total, 12G resident, 398M private, 2.1G shared.
+PhysMem: 61G used (5548M wired, 537M compressor), 66G unused.
+VM: 123T vsize, 4200M framework vsize, 0(0) swapins, 0(0) swapouts.
+Networks: packets: 12345678/9G in, 8765432/5G out.
+Disks: 1234567/45G read, 2345678/78G written.
+
+PID    COMMAND      %CPU TIME     #TH   #WQ  #PORT MEM    PURG   CMPRS  PGRP  PPID  STATE
+12345  firefox      45.2 12:34.56 123   12   456   1234M  0B     890M   12345 1     running
+67890  Xorg         12.3 05:67.89 45    3    789   567M   0B     123M   67890 1     sleeping`
+
+func TestParseTop_MacOS(t *testing.T) {
+	result, ok := parseTop(macTopOutput)
+	require.True(t, ok)
+
+	assert.Contains(t, result, "CPU usage at 15.9%") // 7.1 + 8.8
+	assert.Contains(t, result, "879 total, 4 running")
+	assert.Contains(t, result, "7.1% user")
+	assert.Contains(t, result, "61G used, 66G unused")
+	assert.Contains(t, result, "Load Avg: 2.93 (1m)")
+	assert.Contains(t, result, "**Risk Level**: Low")
+}
+
+func TestTryStructuredRecipeDiagnostic_DiskUsage(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeDiskUsage,
+		IssueClass: diagnose.IssueDisk,
+	}
+
+	// Two tool results: df + du
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"df -h"}`},
+		{Name: "bash", Input: `{"command":"du -xhd 1 / 2>/dev/null | sort -hr | head -15"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: dfLinuxOutput},
+		{Content: "376G\t/home\n42G\t/var\n12G\t/usr\n8.0G\t/opt"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "87%")
+	assert.Contains(t, result, "Top space consumers")
+	assert.Contains(t, result, "376G")
+}
+
+func TestTryStructuredRecipeDiagnostic_MemoryPressure(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeMemoryPressure,
+		IssueClass: diagnose.IssueMemory,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"free -h"}`},
+		{Name: "bash", Input: `{"command":"ps aux --sort=-%mem | head -10"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: freeHumanOutput},
+		{Content: "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot      1234 10.0 25.0 3456789 12345 ?       Sl   Mar06 1234:56 /usr/bin/java"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "Memory usage at")
+	assert.Contains(t, result, "Top memory consumers")
+	assert.Contains(t, result, "java")
+}
+
+func TestTryStructuredRecipeDiagnostic_PerformanceCPU(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipePerformanceCPU,
+		IssueClass: diagnose.IssuePerformance,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"uptime"}`},
+		{Name: "bash", Input: `{"command":"ps aux --sort=-%cpu | head -10"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: " 14:23:05 up 42 days,  3:15,  2 users,  load average: 1.23, 0.98, 0.76"},
+		{Content: "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot      5678 95.0  5.0 234567  8901 ?        R    Mar05  567:89 stress --cpu 8"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "42 days")
+	assert.Contains(t, result, "Top CPU consumers")
+	assert.Contains(t, result, "stress")
+}
+
+func TestParseProcesses_HighCPUSorted(t *testing.T) {
+	input := `USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+nobody    9999  0.1  0.1  12345  2345 ?        S    Mar10   0:01 /usr/sbin/dnsmasq
+user      1234 85.0  3.4 3456789 12345 ?       Sl   Mar06 1234:56 /usr/bin/stress
+root      5678 45.0  2.1 234567  8901 ?        Ss   Mar05  567:89 /usr/lib/xorg/Xorg
+root         1  0.0  0.0 169328 13156 ?        Ss   Mar05   0:09 /sbin/init`
+
+	result, ok := parseProcesses(input)
+	require.True(t, ok)
+
+	// Should be sorted by CPU descending
+	assert.Contains(t, result, "highest CPU: 85.0%")
+	assert.Contains(t, result, "**Risk Level**: High")
+
+	// Verify order: stress (85) before Xorg (45) before dnsmasq (0.1) before init (0)
+	lines := strings.Split(result, "\n")
+	var cpuValues []float64
+	for _, line := range lines {
+		if strings.HasPrefix(line, "- PID ") {
+			// Extract CPU value: "- PID 1234 (user): CPU 85.0%, MEM ..."
+			parts := strings.Split(line, "CPU ")
+			if len(parts) >= 2 {
+				pctStr := strings.Split(parts[1], "%")[0]
+				if cpu, err := strconv.ParseFloat(pctStr, 64); err == nil {
+					cpuValues = append(cpuValues, cpu)
+				}
+			}
+		}
+	}
+	// Verify descending order
+	for i := 1; i < len(cpuValues); i++ {
+		assert.GreaterOrEqual(t, cpuValues[i-1], cpuValues[i],
+			"processes should be sorted by CPU descending: %v", cpuValues)
+	}
 }

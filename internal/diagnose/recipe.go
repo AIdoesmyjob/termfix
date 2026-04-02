@@ -139,7 +139,7 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 			return ""
 		}
 		if runtime.GOOS == "darwin" {
-			return ""
+			return fmt.Sprintf("log show --predicate 'process == \"%s\"' --last 5m --style compact 2>/dev/null | tail -40", r.ServiceName)
 		}
 		return fmt.Sprintf("journalctl -u %s -n 40 --no-pager", shellEscapeToken(r.ServiceName))
 	default:

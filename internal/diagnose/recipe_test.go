@@ -39,10 +39,12 @@ func TestRecipeFollowUpCommand(t *testing.T) {
 
 	serviceRecipe := SelectRecipe("postgres keeps crashing")
 	require.NotNil(t, serviceRecipe)
+	followUp := serviceRecipe.FollowUpCommand("postgres output")
 	if runtime.GOOS == "darwin" {
-		assert.Empty(t, serviceRecipe.FollowUpCommand("postgres output"))
+		assert.Contains(t, followUp, "log show")
+		assert.Contains(t, followUp, "postgres")
 	} else {
-		assert.Contains(t, serviceRecipe.FollowUpCommand("postgres output"), "journalctl -u")
-		assert.Contains(t, serviceRecipe.FollowUpCommand("postgres output"), "postgres")
+		assert.Contains(t, followUp, "journalctl -u")
+		assert.Contains(t, followUp, "postgres")
 	}
 }

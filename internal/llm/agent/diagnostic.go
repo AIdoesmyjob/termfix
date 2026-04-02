@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -108,6 +109,12 @@ func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.
 		return parseDNSRecipe(recipe, toolCalls, toolResults)
 	case diagnose.RecipeNetworkConnectivity:
 		return parseNetworkRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDiskUsage:
+		return parseDiskUsageRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeMemoryPressure:
+		return parseMemoryPressureRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePerformanceCPU:
+		return parsePerformanceCPURecipe(recipe, toolCalls, toolResults)
 	default:
 		return "", false
 	}
@@ -327,6 +334,112 @@ func parseNetworkRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, t
 	return d.Render(), true
 }
 
+func parseDiskUsageRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to single-command parser
+	if len(toolResults) == 1 {
+		return parseDiskUsage(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: df -h output, Tool 1: du output (top dirs)
+	dfResult, dfOK := parseDiskUsage(toolResults[0].Content)
+	if !dfOK {
+		return "", false
+	}
+
+	duLines := firstNonEmptyLines(toolResults[1].Content, 10)
+	if len(duLines) == 0 {
+		return dfResult, true
+	}
+
+	// Merge: append du findings into the df diagnostic
+	// Parse the df result back minimally — just append du as extra findings
+	var b strings.Builder
+	b.WriteString(dfResult)
+	b.WriteString("\n**Top space consumers**:\n")
+	for _, line := range duLines {
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+func parseMemoryPressureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to appropriate single-command parser
+	if len(toolResults) == 1 {
+		cmd := extractCommand(toolCalls[0].Input)
+		if strings.Contains(cmd, "vm_stat") {
+			return parseVmStat(toolResults[0].Content)
+		}
+		return parseMemory(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: free -h / vm_stat, Tool 1: ps aux --sort=-%mem
+	cmd0 := extractCommand(toolCalls[0].Input)
+	var memResult string
+	var memOK bool
+	if strings.Contains(cmd0, "vm_stat") {
+		memResult, memOK = parseVmStat(toolResults[0].Content)
+	} else {
+		memResult, memOK = parseMemory(toolResults[0].Content)
+	}
+	if !memOK {
+		return "", false
+	}
+
+	psLines := firstNonEmptyLines(toolResults[1].Content, 6)
+	if len(psLines) <= 1 {
+		return memResult, true
+	}
+
+	var b strings.Builder
+	b.WriteString(memResult)
+	b.WriteString("\n**Top memory consumers**:\n")
+	for _, line := range psLines[1:] { // skip ps header
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+func parsePerformanceCPURecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to uptime parser
+	if len(toolResults) == 1 {
+		return parseUptime(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: uptime, Tool 1: ps aux --sort=-%cpu
+	uptimeResult, uptimeOK := parseUptime(toolResults[0].Content)
+	if !uptimeOK {
+		return "", false
+	}
+
+	psLines := firstNonEmptyLines(toolResults[1].Content, 6)
+	if len(psLines) <= 1 {
+		return uptimeResult, true
+	}
+
+	var b strings.Builder
+	b.WriteString(uptimeResult)
+	b.WriteString("\n**Top CPU consumers**:\n")
+	for _, line := range psLines[1:] { // skip ps header
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+var sizePattern = regexp.MustCompile(`^\d+(\.\d+)?[BKMGTP]?i?$`)
+
+func looksLikeSize(s string) bool {
+	return sizePattern.MatchString(s) || s == "0"
+}
+
 // riskFromPercent returns a risk level string given a usage percentage.
 func riskFromPercent(pct int) string {
 	switch {
@@ -369,9 +482,13 @@ func parseDiskUsage(output string) (string, bool) {
 		if pctIdx < 3 {
 			continue
 		}
+		size := fields[pctIdx-3]
+		if !looksLikeSize(size) {
+			continue
+		}
 		entries = append(entries, entry{
 			Mount: fields[len(fields)-1],
-			Size:  fields[pctIdx-3],
+			Size:  size,
 			Used:  fields[pctIdx-2],
 			Avail: fields[pctIdx-1],
 			Pct:   fields[pctIdx],
@@ -569,10 +686,20 @@ var (
 	topCPULine  = regexp.MustCompile(`%Cpu.*?(\d+\.?\d*)\s*id`)
 	topMemLine  = regexp.MustCompile(`MiB Mem\s*:\s*([\d.]+)\s+total.*?([\d.]+)\s+free.*?([\d.]+)\s+used`)
 	topTaskLine = regexp.MustCompile(`Tasks:\s*(\d+)\s+total.*?(\d+)\s+running`)
+
+	// macOS top -l1 header regexes
+	macTopProcesses = regexp.MustCompile(`Processes:\s*(\d+)\s+total.*?(\d+)\s+running`)
+	macTopCPU       = regexp.MustCompile(`CPU usage:\s*([\d.]+)%\s*user.*?([\d.]+)%\s*sys.*?([\d.]+)%\s*idle`)
+	macTopMem       = regexp.MustCompile(`PhysMem:\s*(\S+)\s+used.*?(\S+)\s+unused`)
+	macTopLoad      = regexp.MustCompile(`Load Avg:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)`)
 )
 
-// parseTop handles top -bn1 output (Linux).
+// parseTop handles top output (Linux top -bn1 or macOS top -l1).
 func parseTop(output string) (string, bool) {
+	if strings.Contains(output, "CPU usage:") {
+		return parseMacTop(output)
+	}
+
 	lines := strings.Split(output, "\n")
 	if len(lines) < 5 {
 		return "", false
@@ -647,6 +774,93 @@ func parseTop(output string) (string, bool) {
 	return d.Render(), true
 }
 
+// parseMacTop handles macOS top -l1 output.
+func parseMacTop(output string) (string, bool) {
+	lines := strings.Split(output, "\n")
+	if len(lines) < 4 {
+		return "", false
+	}
+
+	var cpuUser, cpuSys, cpuIdle float64
+	var memUsed, memUnused string
+	var tasksTotal, tasksRunning string
+	var load1, load5, load15 string
+
+	for _, line := range lines {
+		if m := macTopCPU.FindStringSubmatch(line); len(m) == 4 {
+			cpuUser, _ = strconv.ParseFloat(m[1], 64)
+			cpuSys, _ = strconv.ParseFloat(m[2], 64)
+			cpuIdle, _ = strconv.ParseFloat(m[3], 64)
+		}
+		if m := macTopMem.FindStringSubmatch(line); len(m) == 3 {
+			memUsed, memUnused = m[1], m[2]
+		}
+		if m := macTopProcesses.FindStringSubmatch(line); len(m) == 3 {
+			tasksTotal, tasksRunning = m[1], m[2]
+		}
+		if m := macTopLoad.FindStringSubmatch(line); len(m) == 4 {
+			load1, load5, load15 = m[1], m[2], m[3]
+		}
+	}
+
+	cpuUsed := cpuUser + cpuSys
+	if cpuIdle == 0 && cpuUsed == 0 {
+		return "", false
+	}
+
+	risk := "Low"
+	switch {
+	case cpuUsed >= 95:
+		risk = "Critical"
+	case cpuUsed >= 90:
+		risk = "High"
+	case cpuUsed >= 70:
+		risk = "Medium"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("CPU usage at %.1f%%", cpuUsed),
+		RiskLevel: risk,
+	}
+	if tasksTotal != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Tasks: %s total, %s running", tasksTotal, tasksRunning))
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("CPU: %.1f%% user, %.1f%% sys, %.1f%% idle", cpuUser, cpuSys, cpuIdle))
+	if load1 != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Load Avg: %s (1m), %s (5m), %s (15m)", load1, load5, load15))
+	}
+	if memUsed != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Memory: %s used, %s unused", memUsed, memUnused))
+	}
+
+	// Collect top processes (lines after the header that have PID data)
+	inProcs := false
+	var topProcs []string
+	for _, line := range lines {
+		if strings.Contains(line, "PID") && (strings.Contains(line, "COMMAND") || strings.Contains(line, "CMD")) {
+			inProcs = true
+			continue
+		}
+		if inProcs && len(strings.TrimSpace(line)) > 0 {
+			topProcs = append(topProcs, strings.TrimSpace(line))
+			if len(topProcs) >= 5 {
+				break
+			}
+		}
+	}
+	for _, proc := range topProcs {
+		fields := strings.Fields(proc)
+		if len(fields) >= 3 {
+			d.Findings = append(d.Findings, fmt.Sprintf("Process: %s", strings.Join(fields, " ")))
+		}
+	}
+
+	if risk != "Low" {
+		d.Remediation = append(d.Remediation, "Identify CPU-heavy processes and consider throttling or restarting them")
+	}
+	return d.Render(), true
+}
+
 // parseProcesses handles ps aux output.
 func parseProcesses(output string) (string, bool) {
 	lines := strings.Split(output, "\n")
@@ -685,6 +899,13 @@ func parseProcesses(output string) (string, bool) {
 		return "", false
 	}
 
+	// Sort by CPU descending so top consumers appear first
+	sort.Slice(procs, func(i, j int) bool {
+		ci, _ := strconv.ParseFloat(procs[i].CPU, 64)
+		cj, _ := strconv.ParseFloat(procs[j].CPU, 64)
+		return ci > cj
+	})
+
 	risk := "Low"
 	switch {
 	case maxCPU >= 80 || maxMem >= 80:
@@ -699,23 +920,19 @@ func parseProcesses(output string) (string, bool) {
 	}
 	d.Findings = append(d.Findings, fmt.Sprintf("Total processes: %d", len(procs)))
 
-	// Show top 5 by CPU
-	shown := 0
-	for _, p := range procs {
-		cpu, _ := strconv.ParseFloat(p.CPU, 64)
-		if cpu > 0.5 || shown < 5 {
-			cmdShort := p.Command
-			if len(cmdShort) > 60 {
-				cmdShort = cmdShort[:60] + "..."
-			}
-			d.Findings = append(d.Findings,
-				fmt.Sprintf("PID %s (%s): CPU %s%%, MEM %s%% — %s",
-					p.PID, p.User, p.CPU, p.MEM, cmdShort))
-			shown++
-			if shown >= 10 {
-				break
-			}
+	// Show top 10 from sorted list
+	limit := 10
+	if limit > len(procs) {
+		limit = len(procs)
+	}
+	for _, p := range procs[:limit] {
+		cmdShort := p.Command
+		if len(cmdShort) > 60 {
+			cmdShort = cmdShort[:60] + "..."
 		}
+		d.Findings = append(d.Findings,
+			fmt.Sprintf("PID %s (%s): CPU %s%%, MEM %s%% — %s",
+				p.PID, p.User, p.CPU, p.MEM, cmdShort))
 	}
 	if risk != "Low" {
 		d.Remediation = append(d.Remediation, "Investigate high-usage processes for possible issues")
@@ -1076,6 +1293,7 @@ func parseSwVers(output string) (string, bool) {
 }
 
 var vmStatLine = regexp.MustCompile(`^(.+?):\s+([\d]+)\.?$`)
+var vmStatPageSize = regexp.MustCompile(`page size of (\d+) bytes`)
 
 // parseVmStat handles macOS vm_stat output.
 func parseVmStat(output string) (string, bool) {
@@ -1086,7 +1304,7 @@ func parseVmStat(output string) (string, bool) {
 
 	// Extract page size from first line
 	pageSize := 4096 // default
-	if m := regexp.MustCompile(`page size of (\d+) bytes`).FindStringSubmatch(lines[0]); len(m) == 2 {
+	if m := vmStatPageSize.FindStringSubmatch(lines[0]); len(m) == 2 {
 		pageSize, _ = strconv.Atoi(m[1])
 	}
 

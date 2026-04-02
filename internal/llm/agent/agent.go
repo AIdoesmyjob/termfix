@@ -400,34 +400,10 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	// Try structured diagnostic first — deterministic parsing, zero fabrication.
 	// Falls through to model Pass 2 for unrecognized commands.
 	if structured, ok := tryStructuredDiagnostic(agentMessage.ToolCalls(), toolResults.ToolResults()); ok {
-		diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
-			Role:  message.Assistant,
-			Parts: []message.ContentPart{message.TextContent{Text: structured}},
-			Model: a.provider.Model().ID,
-		})
-		if err != nil {
-			return a.err(fmt.Errorf("failed to create diagnostic message: %w", err))
-		}
-		diagnosticMessage.AddFinish(message.FinishReasonEndTurn)
-		if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
-			return a.err(fmt.Errorf("failed to update diagnostic message: %w", err))
-		}
-		return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
+		return a.returnStructuredDiagnostic(ctx, sessionID, structured)
 	}
 	if structured, ok := tryStructuredRecipeDiagnostic(routedRecipe, agentMessage.ToolCalls(), toolResults.ToolResults()); ok {
-		diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
-			Role:  message.Assistant,
-			Parts: []message.ContentPart{message.TextContent{Text: structured}},
-			Model: a.provider.Model().ID,
-		})
-		if err != nil {
-			return a.err(fmt.Errorf("failed to create recipe diagnostic message: %w", err))
-		}
-		diagnosticMessage.AddFinish(message.FinishReasonEndTurn)
-		if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
-			return a.err(fmt.Errorf("failed to update recipe diagnostic message: %w", err))
-		}
-		return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
+		return a.returnStructuredDiagnostic(ctx, sessionID, structured)
 	}
 
 	// Fallback: model-based Pass 2 for unrecognized commands
@@ -473,6 +449,22 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 		Message: diagnosticMessage,
 		Done:    true,
 	}
+}
+
+func (a *agent) returnStructuredDiagnostic(ctx context.Context, sessionID, text string) AgentEvent {
+	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:  message.Assistant,
+		Parts: []message.ContentPart{message.TextContent{Text: text}},
+		Model: a.provider.Model().ID,
+	})
+	if err != nil {
+		return a.err(fmt.Errorf("failed to create diagnostic message: %w", err))
+	}
+	diagnosticMessage.AddFinish(message.FinishReasonEndTurn)
+	if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
+		return a.err(fmt.Errorf("failed to update diagnostic message: %w", err))
+	}
+	return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
 }
 
 func (a *agent) createUserMessage(ctx context.Context, sessionID, content string, attachmentParts []message.ContentPart) (message.Message, error) {

@@ -249,7 +249,11 @@ func summarizeGenericOutput(output string) string {
 func toolCallSummaryFromParts(toolCalls []message.ToolCall) string {
 	var parts []string
 	for _, tc := range toolCalls {
-		parts = append(parts, fmt.Sprintf("%s(%s)", tc.Name, tc.Input))
+		input := tc.Input
+		if len(input) > 500 {
+			input = input[:500] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("%s(%s)", tc.Name, input))
 	}
 	return strings.Join(parts, ", ")
 }

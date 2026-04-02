@@ -45,3 +45,24 @@ func TestExtractServiceName(t *testing.T) {
 	assert.Equal(t, "postgres", ExtractServiceName("postgres keeps crashing"))
 	assert.Equal(t, "", ExtractServiceName("the server is slow"))
 }
+
+func TestExtractServiceName_Expanded(t *testing.T) {
+	assert.Equal(t, "caddy", ExtractServiceName("caddy keeps restarting"))
+	assert.Equal(t, "grafana", ExtractServiceName("grafana dashboard won't load"))
+	assert.Equal(t, "haproxy", ExtractServiceName("haproxy is down"))
+	assert.Equal(t, "elasticsearch", ExtractServiceName("elasticsearch cluster red"))
+	assert.Equal(t, "traefik", ExtractServiceName("traefik proxy not routing"))
+	assert.Equal(t, "prometheus", ExtractServiceName("prometheus scrape failing"))
+	assert.Equal(t, "rabbitmq", ExtractServiceName("rabbitmq queue stuck"))
+	assert.Equal(t, "consul", ExtractServiceName("consul agent not joining"))
+}
+
+func TestExtractServiceName_Fallback(t *testing.T) {
+	// Unknown service name matched by fallback pattern
+	assert.Equal(t, "myapp", ExtractServiceName("myapp service won't start"))
+	assert.Equal(t, "foo-bar", ExtractServiceName("foo-bar daemon keeps crashing"))
+	assert.Equal(t, "my-svc", ExtractServiceName("my-svc failed to start"))
+	// False positives should be rejected
+	assert.Equal(t, "", ExtractServiceName("the service is slow"))
+	assert.Equal(t, "", ExtractServiceName("my service keeps failing"))
+}

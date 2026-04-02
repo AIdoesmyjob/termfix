@@ -290,12 +290,24 @@ func containsAny(value string, needles ...string) bool {
 	return false
 }
 
-var serviceNameRe = regexp.MustCompile(`\b(nginx|apache2?|httpd|sshd|ssh|docker|postgres(?:ql)?|mysql|mariadb|redis|kubelet|tailscaled|avahi-daemon)\b`)
+var serviceNameRe = regexp.MustCompile(`\b(nginx|apache2?|httpd|sshd|ssh|docker|postgres(?:ql)?|mysql|mariadb|redis|kubelet|tailscaled|avahi-daemon|caddy|grafana|prometheus|alertmanager|haproxy|traefik|elasticsearch|kibana|logstash|consul|vault|nomad|envoy|minio|rabbitmq|mosquitto|mongod?|memcached|couchdb|influxdb|telegraf|collectd|chrony|ntpd|dnsmasq|unbound|named|bind9?|postfix|dovecot|openvpn|wireguard)\b`)
+
+var serviceNameFallbackRe = regexp.MustCompile(`\b([a-z][a-z0-9_-]{1,30})\s+(?:service|daemon|won'?t\s+start|keeps?\s+(?:crash|restart|fail)|failed|is\s+down)`)
+
+var falsePositiveServices = map[string]bool{
+	"the": true, "my": true, "this": true, "a": true,
+	"an": true, "our": true, "your": true,
+}
 
 func ExtractServiceName(value string) string {
 	match := serviceNameRe.FindStringSubmatch(value)
-	if len(match) < 2 {
-		return ""
+	if len(match) >= 2 {
+		return match[1]
 	}
-	return match[1]
+	// Fallback: pattern like "<name> service" or "<name> won't start"
+	fallback := serviceNameFallbackRe.FindStringSubmatch(value)
+	if len(fallback) >= 2 && !falsePositiveServices[fallback[1]] {
+		return fallback[1]
+	}
+	return ""
 }
