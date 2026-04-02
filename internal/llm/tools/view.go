@@ -177,12 +177,20 @@ func (v *viewTool) Run(ctx context.Context, call ToolCall) (ToolResponse, error)
 	notifyLspOpenFile(ctx, filePath, v.lspClients)
 	output := "<file>\n"
 	// Format the output with line numbers
-	output += addLineNumbers(content, params.Offset+1)
+	startLine := 1
+	if params.Offset > 0 {
+		startLine = params.Offset
+	}
+	output += addLineNumbers(content, startLine)
 
 	// Add a note if the content was truncated
-	if lineCount > params.Offset+len(strings.Split(content, "\n")) {
+	displayedLines := 0
+	if content != "" {
+		displayedLines = len(strings.Split(content, "\n"))
+	}
+	if lineCount > startLine+displayedLines-1 {
 		output += fmt.Sprintf("\n\n(File has more lines. Use 'offset' parameter to read beyond line %d)",
-			params.Offset+len(strings.Split(content, "\n")))
+			startLine+displayedLines-1)
 	}
 	output += "\n</file>\n"
 	output += getDiagnostics(filePath, v.lspClients)
@@ -198,7 +206,10 @@ func (v *viewTool) Run(ctx context.Context, call ToolCall) (ToolResponse, error)
 
 func addLineNumbers(content string, startLine int) string {
 	if content == "" {
-		return ""
+		if startLine <= 0 {
+			startLine = 1
+		}
+		return fmt.Sprintf("%6d|", startLine)
 	}
 
 	lines := strings.Split(content, "\n")
@@ -228,40 +239,30 @@ func readTextFile(filePath string, offset, limit int) (string, int, error) {
 	}
 	defer file.Close()
 
-	lineCount := 0
+	if limit <= 0 {
+		limit = DefaultReadLimit
+	}
 
-	scanner := NewLineScanner(file)
+	startLine := 1
 	if offset > 0 {
-		for lineCount < offset && scanner.Scan() {
-			lineCount++
-		}
-		if err = scanner.Err(); err != nil {
-			return "", 0, err
-		}
+		startLine = offset
 	}
 
-	if offset == 0 {
-		_, err = file.Seek(0, io.SeekStart)
-		if err != nil {
-			return "", 0, err
-		}
-	}
-
+	lineCount := 0
+	scanner := NewLineScanner(file)
 	var lines []string
-	lineCount = offset
-
-	for scanner.Scan() && len(lines) < limit {
+	for scanner.Scan() {
 		lineCount++
+		if lineCount < startLine {
+			continue
+		}
 		lineText := scanner.Text()
 		if len(lineText) > MaxLineLength {
 			lineText = lineText[:MaxLineLength] + "..."
 		}
-		lines = append(lines, lineText)
-	}
-
-	// Continue scanning to get total line count
-	for scanner.Scan() {
-		lineCount++
+		if len(lines) < limit {
+			lines = append(lines, lineText)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {

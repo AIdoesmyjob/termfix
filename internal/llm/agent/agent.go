@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/opencode-ai/opencode/internal/config"
+	"github.com/opencode-ai/opencode/internal/diagnose"
 	"github.com/opencode-ai/opencode/internal/llm/models"
 	"github.com/opencode-ai/opencode/internal/llm/prompt"
 	"github.com/opencode-ai/opencode/internal/llm/provider"
@@ -74,6 +75,9 @@ type agent struct {
 
 	tools    []tools.BaseTool
 	provider provider.Provider
+	// diagnosticProvider uses a separate pass-2 prompt that is optimized
+	// for grounded analysis instead of tool selection.
+	diagnosticProvider provider.Provider
 
 	titleProvider     provider.Provider
 	summarizeProvider provider.Provider
@@ -87,35 +91,43 @@ func NewAgent(
 	messages message.Service,
 	agentTools []tools.BaseTool,
 ) (Service, error) {
-	agentProvider, err := createAgentProvider(agentName)
+	agentProvider, err := createAgentProvider(agentName, "")
 	if err != nil {
 		return nil, err
+	}
+	var diagnosticProvider provider.Provider
+	if agentName == config.AgentCoder {
+		diagnosticProvider, err = createAgentProvider(agentName, prompt.GetAgentDiagnosticPrompt(agentName, agentProvider.Model().Provider))
+		if err != nil {
+			return nil, err
+		}
 	}
 	var titleProvider provider.Provider
 	// Only generate titles for the coder agent
 	if agentName == config.AgentCoder {
-		titleProvider, err = createAgentProvider(config.AgentTitle)
+		titleProvider, err = createAgentProvider(config.AgentTitle, "")
 		if err != nil {
 			return nil, err
 		}
 	}
 	var summarizeProvider provider.Provider
 	if agentName == config.AgentCoder {
-		summarizeProvider, err = createAgentProvider(config.AgentSummarizer)
+		summarizeProvider, err = createAgentProvider(config.AgentSummarizer, "")
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	agent := &agent{
-		Broker:            pubsub.NewBroker[AgentEvent](),
-		provider:          agentProvider,
-		messages:          messages,
-		sessions:          sessions,
-		tools:             agentTools,
-		titleProvider:     titleProvider,
-		summarizeProvider: summarizeProvider,
-		activeRequests:    sync.Map{},
+		Broker:             pubsub.NewBroker[AgentEvent](),
+		provider:           agentProvider,
+		diagnosticProvider: diagnosticProvider,
+		messages:           messages,
+		sessions:           sessions,
+		tools:              agentTools,
+		titleProvider:      titleProvider,
+		summarizeProvider:  summarizeProvider,
+		activeRequests:     sync.Map{},
 	}
 
 	return agent, nil
@@ -290,22 +302,36 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	default:
 	}
 
-	// PASS 1: Tool selection (non-streaming for proper tool_call detection)
-	// llama-server's grammar-based tool parsing only works reliably with non-streaming requests.
-	// With streaming, tool call XML is sent as content deltas and not parsed into tool_calls.
-	//
-	// Skip tools for knowledge/explanation queries — the 0.8B model incorrectly
-	// calls bash for conceptual questions like "what is SSH" when tools are available.
+	// PASS 1: Tool selection.
+	// For obvious troubleshooting intents, bypass the model and route directly
+	// to a bounded first probe. This is much more reliable for a 0.8B model.
 	pass1Tools := a.tools
+	var pass1Response *provider.ProviderResponse
 	if isKnowledgeQuery(content) {
 		pass1Tools = nil
 	}
-	pass1Response, err := a.provider.SendMessages(ctx, msgHistory, pass1Tools)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return a.err(ErrRequestCancelled)
+	var routedRecipe *diagnose.Recipe
+	if pass1Response == nil {
+		routedRecipe = diagnose.SelectRecipe(content)
+		if routed := routeDiagnosticIntent(routedRecipe); routed != nil {
+			pass1Response = &provider.ProviderResponse{
+				ToolCalls:    []message.ToolCall{*routed},
+				FinishReason: message.FinishReasonToolUse,
+			}
+			logging.Info("Pass 1 routed deterministically", "recipe", routedRecipe.Name, "tool", routed.Name, "input", routed.Input)
 		}
-		return a.err(fmt.Errorf("failed to send pass 1 messages: %w", err))
+	}
+	if pass1Response == nil {
+		// llama-server's grammar-based tool parsing only works reliably with
+		// non-streaming requests. With streaming, tool call XML is sent as
+		// content deltas and not parsed into tool_calls.
+		pass1Response, err = a.provider.SendMessages(ctx, msgHistory, pass1Tools)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return a.err(ErrRequestCancelled)
+			}
+			return a.err(fmt.Errorf("failed to send pass 1 messages: %w", err))
+		}
 	}
 
 	// Save the pass 1 response as an assistant message
@@ -339,35 +365,23 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	ctx = context.WithValue(ctx, tools.MessageIDContextKey, agentMessage.ID)
 	var toolResults *message.Message
 	for _, tc := range pass1Response.ToolCalls {
-		// Sanitize tool call inputs from local models — the small model sometimes
-		// generates hallucinated text inside parameter values (analysis, fake output, etc.)
-		sanitizedInput := sanitizeToolInput(tc.Name, tc.Input)
-		for _, availableTool := range a.tools {
-			if availableTool.Info().Name == tc.Name {
-				toolCall := tools.ToolCall{
-					ID:    tc.ID,
-					Name:  tc.Name,
-					Input: sanitizedInput,
-				}
-				result, resultErr := availableTool.Run(ctx, toolCall)
-				if resultErr != nil {
-					result = tools.ToolResponse{Content: fmt.Sprintf("Error: %v", resultErr)}
-				}
-				if toolResults == nil {
-					trMsg, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
-						Role:  message.Tool,
-						Parts: []message.ContentPart{},
-					})
-					if createErr != nil {
-						return a.err(fmt.Errorf("failed to create tool result message: %w", createErr))
-					}
-					toolResults = &trMsg
-				}
-				toolResults.AddToolResult(message.ToolResult{
-					ToolCallID: tc.ID,
-					Content:    result.Content,
-				})
-				break
+		toolResults, err = a.executeToolCall(ctx, sessionID, tc, toolResults)
+		if err != nil {
+			return a.err(err)
+		}
+	}
+
+	if routedRecipe != nil && toolResults != nil {
+		if followUpCommand := routedRecipe.FollowUpCommand(toolResultContent(toolResults)); followUpCommand != "" {
+			followUp := newBashToolCall(fmt.Sprintf("%s_follow_up", routedRecipe.Name), followUpCommand)
+			agentMessage.AddToolCall(*followUp)
+			if err := a.messages.Update(ctx, agentMessage); err != nil {
+				return a.err(fmt.Errorf("failed to update pass 1 message with follow-up: %w", err))
+			}
+			logging.Info("Executing deterministic follow-up", "recipe", routedRecipe.Name, "command", followUpCommand)
+			toolResults, err = a.executeToolCall(ctx, sessionID, *followUp, toolResults)
+			if err != nil {
+				return a.err(err)
 			}
 		}
 	}
@@ -400,14 +414,24 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 		}
 		return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
 	}
+	if structured, ok := tryStructuredRecipeDiagnostic(routedRecipe, agentMessage.ToolCalls(), toolResults.ToolResults()); ok {
+		diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+			Role:  message.Assistant,
+			Parts: []message.ContentPart{message.TextContent{Text: structured}},
+			Model: a.provider.Model().ID,
+		})
+		if err != nil {
+			return a.err(fmt.Errorf("failed to create recipe diagnostic message: %w", err))
+		}
+		diagnosticMessage.AddFinish(message.FinishReasonEndTurn)
+		if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
+			return a.err(fmt.Errorf("failed to update recipe diagnostic message: %w", err))
+		}
+		return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
+	}
 
 	// Fallback: model-based Pass 2 for unrecognized commands
-	pass2Content := fmt.Sprintf(
-		"%s\n\nI ran `%s` and got:\n```\n%s\n```\nAnalyze these results.",
-		content,
-		toolCallSummary(agentMessage),
-		toolOutput,
-	)
+	pass2Content := buildPass2Content(content, routedRecipe, agentMessage.ToolCalls(), toolResults.ToolResults())
 	pass2Msg, err := a.createUserMessage(ctx, sessionID, pass2Content, nil)
 	if err != nil {
 		return a.err(fmt.Errorf("failed to create pass 2 user message: %w", err))
@@ -415,7 +439,11 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	pass2History := []message.Message{pass2Msg}
 
 	// Pass 2: non-streaming, no tools — forces text-only diagnostic generation
-	pass2Response, err := a.provider.SendMessages(ctx, pass2History, nil)
+	diagnosticProvider := a.provider
+	if a.diagnosticProvider != nil {
+		diagnosticProvider = a.diagnosticProvider
+	}
+	pass2Response, err := diagnosticProvider.SendMessages(ctx, pass2History, nil)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return a.err(ErrRequestCancelled)
@@ -430,7 +458,7 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 		Role:  message.Assistant,
 		Parts: []message.ContentPart{message.TextContent{Text: diagnosticContent}},
-		Model: a.provider.Model().ID,
+		Model: diagnosticProvider.Model().ID,
 	})
 	if err != nil {
 		return a.err(fmt.Errorf("failed to create diagnostic message: %w", err))
@@ -578,12 +606,16 @@ out:
 // This is Pass 2 of the two-pass architecture for small models.
 func (a *agent) streamDiagnostic(ctx context.Context, sessionID string, msgHistory []message.Message) (message.Message, error) {
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
-	eventChan := a.provider.StreamResponse(ctx, msgHistory, nil) // NO tools
+	diagnosticProvider := a.provider
+	if a.diagnosticProvider != nil {
+		diagnosticProvider = a.diagnosticProvider
+	}
+	eventChan := diagnosticProvider.StreamResponse(ctx, msgHistory, nil) // NO tools
 
 	assistantMsg, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 		Role:  message.Assistant,
 		Parts: []message.ContentPart{},
-		Model: a.provider.Model().ID,
+		Model: diagnosticProvider.Model().ID,
 	})
 	if err != nil {
 		return assistantMsg, fmt.Errorf("failed to create diagnostic message: %w", err)
@@ -893,12 +925,19 @@ func (a *agent) Update(agentName config.AgentName, modelID models.ModelID) (mode
 		return models.Model{}, fmt.Errorf("failed to update config: %w", err)
 	}
 
-	provider, err := createAgentProvider(agentName)
+	provider, err := createAgentProvider(agentName, "")
 	if err != nil {
 		return models.Model{}, fmt.Errorf("failed to create provider for model %s: %w", modelID, err)
 	}
 
 	a.provider = provider
+	if agentName == config.AgentCoder {
+		diagnosticProvider, err := createAgentProvider(agentName, prompt.GetAgentDiagnosticPrompt(agentName, provider.Model().Provider))
+		if err != nil {
+			return models.Model{}, fmt.Errorf("failed to create diagnostic provider for model %s: %w", modelID, err)
+		}
+		a.diagnosticProvider = diagnosticProvider
+	}
 
 	return a.provider.Model(), nil
 }
@@ -1074,7 +1113,7 @@ func (a *agent) Summarize(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func createAgentProvider(agentName config.AgentName) (provider.Provider, error) {
+func createAgentProvider(agentName config.AgentName, systemPrompt string) (provider.Provider, error) {
 	cfg := config.Get()
 	agentConfig, ok := cfg.Agents[agentName]
 	if !ok {
@@ -1099,9 +1138,12 @@ func createAgentProvider(agentName config.AgentName) (provider.Provider, error) 
 	opts := []provider.ProviderClientOption{
 		provider.WithAPIKey(providerCfg.APIKey),
 		provider.WithModel(model),
-		provider.WithSystemMessage(prompt.GetAgentPrompt(agentName, model.Provider)),
 		provider.WithMaxTokens(maxTokens),
 	}
+	if systemPrompt == "" {
+		systemPrompt = prompt.GetAgentPrompt(agentName, model.Provider)
+	}
+	opts = append(opts, provider.WithSystemMessage(systemPrompt))
 	if model.Provider == models.ProviderOpenAI || model.Provider == models.ProviderLocal && model.CanReason {
 		opts = append(
 			opts,
@@ -1126,4 +1168,80 @@ func createAgentProvider(agentName config.AgentName) (provider.Provider, error) 
 	}
 
 	return agentProvider, nil
+}
+
+func (a *agent) executeToolCall(ctx context.Context, sessionID string, tc message.ToolCall, toolResults *message.Message) (*message.Message, error) {
+	sanitizedInput := sanitizeToolInput(tc.Name, tc.Input)
+	for _, availableTool := range a.tools {
+		if availableTool.Info().Name != tc.Name {
+			continue
+		}
+
+		toolCall := tools.ToolCall{
+			ID:    tc.ID,
+			Name:  tc.Name,
+			Input: sanitizedInput,
+		}
+		result, resultErr := availableTool.Run(ctx, toolCall)
+		if resultErr != nil {
+			result = tools.ToolResponse{Content: fmt.Sprintf("Error: %v", resultErr)}
+		}
+		if toolResults == nil {
+			trMsg, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+				Role:  message.Tool,
+				Parts: []message.ContentPart{},
+			})
+			if createErr != nil {
+				return nil, fmt.Errorf("failed to create tool result message: %w", createErr)
+			}
+			toolResults = &trMsg
+		}
+		toolResults.AddToolResult(message.ToolResult{
+			ToolCallID: tc.ID,
+			Content:    result.Content,
+		})
+		return toolResults, nil
+	}
+
+	if toolResults == nil {
+		trMsg, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+			Role:  message.Tool,
+			Parts: []message.ContentPart{},
+		})
+		if createErr != nil {
+			return nil, fmt.Errorf("failed to create tool result message: %w", createErr)
+		}
+		toolResults = &trMsg
+	}
+	toolResults.AddToolResult(message.ToolResult{
+		ToolCallID: tc.ID,
+		Content:    fmt.Sprintf("Error: tool not found: %s", tc.Name),
+		IsError:    true,
+	})
+	return toolResults, nil
+}
+
+func routeDiagnosticIntent(recipe *diagnose.Recipe) *message.ToolCall {
+	if recipe == nil || recipe.InitialCommand == "" {
+		return nil
+	}
+
+	return newBashToolCall(string(recipe.Name), recipe.InitialCommand)
+}
+
+func newBashToolCall(label string, command string) *message.ToolCall {
+	input, err := json.Marshal(map[string]any{
+		"command": command,
+	})
+	if err != nil {
+		return nil
+	}
+
+	return &message.ToolCall{
+		ID:       fmt.Sprintf("%s_%d", label, time.Now().UnixNano()),
+		Name:     tools.BashToolName,
+		Input:    string(input),
+		Type:     "function",
+		Finished: true,
+	}
 }

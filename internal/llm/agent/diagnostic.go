@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/opencode-ai/opencode/internal/diagnose"
 	"github.com/opencode-ai/opencode/internal/message"
 )
 
@@ -95,6 +96,23 @@ func tryStructuredDiagnostic(toolCalls []message.ToolCall, toolResults []message
 	}
 }
 
+func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if recipe == nil || len(toolCalls) == 0 || len(toolResults) == 0 {
+		return "", false
+	}
+
+	switch recipe.Name {
+	case diagnose.RecipeServiceFailure:
+		return parseServiceFailureRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDNSResolution:
+		return parseDNSRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeNetworkConnectivity:
+		return parseNetworkRecipe(recipe, toolCalls, toolResults)
+	default:
+		return "", false
+	}
+}
+
 // extractCommand parses the JSON input of a bash tool call to get the command string.
 func extractCommand(inputJSON string) string {
 	var params map[string]interface{}
@@ -146,6 +164,167 @@ func detectCommandKey(command string) string {
 		}
 	}
 	return ""
+}
+
+func parseServiceFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	statusOutput := toolResults[0].Content
+	logOutput := toolResults[1].Content
+	if strings.TrimSpace(statusOutput) == "" || strings.TrimSpace(logOutput) == "" {
+		return "", false
+	}
+
+	statusLines := grepLines(statusOutput, `(?i)(Active:|Loaded:|Main PID:|status=|failed)`)
+	errorLines := grepLines(logOutput, `(?i)(error|failed|fatal|panic|denied|permission|address already in use|exception|invalid|not found|refused)`)
+	if len(statusLines) == 0 && len(errorLines) == 0 {
+		return "", false
+	}
+
+	serviceName := recipe.ServiceName
+	if serviceName == "" {
+		serviceName = "service"
+	}
+	rootCause := "service failure"
+	for _, line := range errorLines {
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "address already in use"):
+			rootCause = "port conflict"
+		case strings.Contains(lower, "permission denied") || strings.Contains(lower, "denied"):
+			rootCause = "permission error"
+		case strings.Contains(lower, "not found"):
+			rootCause = "missing dependency or file"
+		case strings.Contains(lower, "invalid"):
+			rootCause = "invalid configuration"
+		}
+		if rootCause != "service failure" {
+			break
+		}
+	}
+
+	risk := "High"
+	if rootCause == "port conflict" || rootCause == "permission error" {
+		risk = "Critical"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s is failing to start due to %s", serviceName, rootCause),
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(statusLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+	for _, line := range firstN(errorLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	switch rootCause {
+	case "port conflict":
+		d.Remediation = append(d.Remediation, "Find the conflicting listener and free the port before restarting the service")
+	case "permission error":
+		d.Remediation = append(d.Remediation, "Fix the file, directory, or capability permissions the service needs at startup")
+	case "invalid configuration":
+		d.Remediation = append(d.Remediation, "Validate and correct the service configuration before restarting")
+	default:
+		d.Remediation = append(d.Remediation, "Review the recent service errors and fix the failing dependency or configuration")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Re-run `systemctl status %s --no-pager --full -n 20` after applying the fix", serviceName))
+	return d.Render(), true
+}
+
+func parseDNSRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	dnsOutput := toolResults[0].Content
+	routeOutput := toolResults[1].Content
+	if strings.TrimSpace(dnsOutput) == "" && strings.TrimSpace(routeOutput) == "" {
+		return "", false
+	}
+
+	nameservers := grepLines(dnsOutput, `(?i)(^nameserver\s+|nameserver\[[0-9]+\])`)
+	searchDomains := grepLines(dnsOutput, `(?i)^(search|domain)\s+`)
+	defaultRoutes := grepLines(routeOutput, `(?i)^(default|0\.0\.0\.0)`)
+	if len(nameservers) == 0 && len(defaultRoutes) == 0 {
+		return "", false
+	}
+
+	risk := "Low"
+	summary := "DNS and routing look present"
+	if len(nameservers) == 0 {
+		risk = "High"
+		summary = "No DNS nameservers found in resolver configuration"
+	} else if len(defaultRoutes) == 0 {
+		risk = "High"
+		summary = "DNS is configured but no default route is visible"
+	} else if len(searchDomains) == 0 {
+		risk = "Medium"
+		summary = "DNS nameservers are configured; verify resolution path and search domain needs"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	if len(nameservers) > 0 {
+		d.Findings = append(d.Findings, "Nameservers: "+strings.Join(firstN(nameservers, 3), "; "))
+	}
+	if len(searchDomains) > 0 {
+		d.Findings = append(d.Findings, "Search domains: "+strings.Join(firstN(searchDomains, 2), "; "))
+	}
+	if len(defaultRoutes) > 0 {
+		d.Findings = append(d.Findings, "Default route: "+strings.Join(firstN(defaultRoutes, 2), "; "))
+	}
+	if len(nameservers) == 0 {
+		d.Remediation = append(d.Remediation, "Add or restore valid nameserver entries before retrying resolution")
+	}
+	if len(defaultRoutes) == 0 {
+		d.Remediation = append(d.Remediation, "Restore a default route so DNS queries can leave the host")
+	}
+	if len(nameservers) > 0 && len(defaultRoutes) > 0 {
+		d.Remediation = append(d.Remediation, "Test name resolution directly against a configured resolver to confirm query success")
+	}
+	return d.Render(), true
+}
+
+func parseNetworkRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	interfaceOutput := toolResults[0].Content
+	routeOutput := toolResults[1].Content
+
+	defaultRoutes := grepLines(routeOutput, `(?i)^(default|0\.0\.0\.0)`)
+	ifaceLines := firstNonEmptyLines(interfaceOutput, 6)
+	if len(defaultRoutes) == 0 && len(ifaceLines) == 0 {
+		return "", false
+	}
+
+	risk := "Medium"
+	summary := "Interfaces detected; verify route and interface state"
+	if len(defaultRoutes) == 0 {
+		risk = "High"
+		summary = "Interface data is present but no default route is visible"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	if len(ifaceLines) > 0 {
+		d.Findings = append(d.Findings, "Interface summary: "+strings.Join(ifaceLines, "; "))
+	}
+	if len(defaultRoutes) > 0 {
+		d.Findings = append(d.Findings, "Default route: "+strings.Join(firstN(defaultRoutes, 2), "; "))
+	}
+	if len(defaultRoutes) == 0 {
+		d.Remediation = append(d.Remediation, "Restore a default route or reconnect the interface that should carry outbound traffic")
+	} else {
+		d.Remediation = append(d.Remediation, "Validate the active interface and gateway with a direct connectivity check")
+	}
+	return d.Render(), true
 }
 
 // riskFromPercent returns a risk level string given a usage percentage.
@@ -836,7 +1015,7 @@ func parseUname(output string) (string, bool) {
 		return "", false
 	}
 
-	os := fields[0]     // "Linux" or "Darwin"
+	os := fields[0] // "Linux" or "Darwin"
 	hostname := fields[1]
 	kernel := fields[2]
 	arch := ""

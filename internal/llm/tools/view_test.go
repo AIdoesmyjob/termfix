@@ -75,8 +75,8 @@ func TestAddLineNumbers(t *testing.T) {
 			content:   "",
 			startLine: 1,
 			checks: func(t *testing.T, result string) {
-				// Should handle empty content gracefully
 				assert.Contains(t, result, "1")
+				assert.Contains(t, result, "|")
 			},
 		},
 	}
@@ -213,6 +213,8 @@ func TestViewRunValidFile(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, resp.IsError, "viewing with offset/limit should not error")
 		assert.Contains(t, resp.Content, "line 5")
+		assert.Contains(t, resp.Content, "line 7")
+		assert.NotContains(t, resp.Content, "line 4")
 	})
 }
 

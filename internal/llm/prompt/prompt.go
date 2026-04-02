@@ -16,7 +16,7 @@ func GetAgentPrompt(agentName config.AgentName, provider models.ModelProvider) s
 	basePrompt := ""
 	switch agentName {
 	case config.AgentCoder:
-		basePrompt = CoderPrompt(provider)
+		basePrompt = CoderToolSelectionPrompt(provider)
 	case config.AgentTitle:
 		basePrompt = TitlePrompt(provider)
 	case config.AgentTask:
@@ -36,6 +36,15 @@ func GetAgentPrompt(agentName config.AgentName, provider models.ModelProvider) s
 		}
 	}
 	return basePrompt
+}
+
+func GetAgentDiagnosticPrompt(agentName config.AgentName, provider models.ModelProvider) string {
+	switch agentName {
+	case config.AgentCoder:
+		return CoderDiagnosticPrompt(provider)
+	default:
+		return GetAgentPrompt(agentName, provider)
+	}
 }
 
 var (

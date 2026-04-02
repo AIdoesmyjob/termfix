@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/opencode-ai/opencode/internal/diagnose"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -111,6 +112,45 @@ func TestTryStructuredDiagnostic_MultipleToolCalls(t *testing.T) {
 	toolResults := []message.ToolResult{{Content: "some output"}}
 	_, ok := tryStructuredDiagnostic(toolCalls, toolResults)
 	assert.False(t, ok)
+}
+
+func TestTryStructuredRecipeDiagnostic_ServiceFailure(t *testing.T) {
+	recipe := diagnose.SelectRecipe("nginx won't start")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"systemctl status nginx --no-pager --full -n 20"}`},
+		{Name: "bash", Input: `{"command":"journalctl -u nginx -n 40 --no-pager"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "Loaded: loaded (/usr/lib/systemd/system/nginx.service)\nActive: failed (Result: exit-code)\nMain PID: 1234 (code=exited, status=1/FAILURE)"},
+		{Content: "Apr 01 nginx[1234]: bind() to 0.0.0.0:80 failed (98: Address already in use)\nApr 01 systemd[1]: nginx.service: Failed with result 'exit-code'."},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "nginx is failing to start due to port conflict")
+	assert.Contains(t, result, "Address already in use")
+}
+
+func TestTryStructuredRecipeDiagnostic_DNSResolution(t *testing.T) {
+	recipe := diagnose.SelectRecipe("dns resolution is broken")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"cat /etc/resolv.conf"}`},
+		{Name: "bash", Input: `{"command":"ip route"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "nameserver 1.1.1.1\nsearch corp.local"},
+		{Content: "default via 192.168.1.1 dev eth0"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "DNS and routing look present")
+	assert.Contains(t, result, "Nameservers")
+	assert.Contains(t, result, "Default route")
 }
 
 // --- Disk Usage ---
@@ -545,9 +585,9 @@ func TestParseEtcFile(t *testing.T) {
 
 func TestDiagnosticResult_Render(t *testing.T) {
 	d := DiagnosticResult{
-		Summary:   "Test summary",
-		RiskLevel: "High",
-		Findings:  []string{"Finding 1", "Finding 2"},
+		Summary:     "Test summary",
+		RiskLevel:   "High",
+		Findings:    []string{"Finding 1", "Finding 2"},
 		Remediation: []string{"Fix 1", "Fix 2"},
 	}
 	result := d.Render()
@@ -582,7 +622,7 @@ func TestParseSize(t *testing.T) {
 		{"15Gi", 15 * 1024},
 		{"8.2Gi", 8.2 * 1024},
 		{"2.0Gi", 2.0 * 1024},
-		{"16384", 16384},       // plain number = MB
+		{"16384", 16384}, // plain number = MB
 		{"512Mi", 512},
 		{"1.5G", 1.5 * 1024},
 		{"100K", 100.0 / 1024},

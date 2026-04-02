@@ -2,11 +2,15 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/opencode-ai/opencode/internal/diagnose"
+	"github.com/opencode-ai/opencode/internal/llm/tools"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/opencode-ai/opencode/internal/pubsub"
 	"github.com/stretchr/testify/assert"
@@ -217,4 +221,95 @@ func TestToolResultContent(t *testing.T) {
 		result := toolResultContent(&msg)
 		assert.Equal(t, "", result)
 	})
+}
+
+func TestRouteDiagnosticIntent(t *testing.T) {
+	t.Run("disk issues route to bash", func(t *testing.T) {
+		call := routeDiagnosticIntent(diagnose.SelectRecipe("disk space is running low"))
+		require.NotNil(t, call)
+		assert.Equal(t, tools.BashToolName, call.Name)
+
+		var input map[string]string
+		require.NoError(t, json.Unmarshal([]byte(call.Input), &input))
+		assert.Equal(t, "df -h", input["command"])
+	})
+
+	t.Run("knowledge queries do not route", func(t *testing.T) {
+		call := routeDiagnosticIntent(diagnose.SelectRecipe("what is DNS"))
+		assert.Nil(t, call)
+	})
+
+	t.Run("service issues prefer service status probe", func(t *testing.T) {
+		call := routeDiagnosticIntent(diagnose.SelectRecipe("nginx won't start after reboot"))
+		require.NotNil(t, call)
+
+		var input map[string]string
+		require.NoError(t, json.Unmarshal([]byte(call.Input), &input))
+		if runtime.GOOS == "darwin" {
+			assert.Contains(t, input["command"], "launchctl")
+			assert.Contains(t, input["command"], "nginx")
+		} else {
+			assert.Contains(t, input["command"], "systemctl status")
+			assert.Contains(t, input["command"], "nginx")
+		}
+	})
+}
+
+func TestRouteDiagnosticIntentMatchesClassifier(t *testing.T) {
+	issue := diagnose.ClassifyIssue("dns resolution is broken")
+	require.Equal(t, diagnose.IssueDNS, issue)
+
+	call := routeDiagnosticIntent(diagnose.SelectRecipe("dns resolution is broken"))
+	require.NotNil(t, call)
+
+	var input map[string]string
+	require.NoError(t, json.Unmarshal([]byte(call.Input), &input))
+	if runtime.GOOS == "darwin" {
+		assert.Equal(t, "scutil --dns", input["command"])
+	} else {
+		assert.Equal(t, "cat /etc/resolv.conf", input["command"])
+	}
+}
+
+func TestBuildStructuredEvidence(t *testing.T) {
+	recipe := diagnose.SelectRecipe("nginx won't start")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"systemctl status nginx --no-pager --full -n 20"}`},
+		{Name: "bash", Input: `{"command":"journalctl -u nginx -n 40 --no-pager"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "Loaded: loaded (/usr/lib/systemd/system/nginx.service)\nActive: failed (Result: exit-code)\nMain PID: 1234 (code=exited, status=1/FAILURE)"},
+		{Content: "Apr 01 10:00:00 host nginx[1234]: bind() to 0.0.0.0:80 failed (98: Address already in use)\nApr 01 10:00:00 host systemd[1]: nginx.service: Failed with result 'exit-code'."},
+	}
+
+	evidence := buildStructuredEvidence(recipe, toolCalls, toolResults)
+	assert.Contains(t, evidence, "Evidence Bundle")
+	assert.Contains(t, evidence, "Recipe: service_failure")
+	assert.Contains(t, evidence, "Service: nginx")
+	assert.Contains(t, evidence, "Service status")
+	assert.Contains(t, evidence, "Recent service errors")
+	assert.Contains(t, evidence, "Address already in use")
+}
+
+func TestBuildPass2ContentUsesEvidenceBundle(t *testing.T) {
+	recipe := diagnose.SelectRecipe("dns resolution is broken")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"cat /etc/resolv.conf"}`},
+		{Name: "bash", Input: `{"command":"ip route"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "nameserver 1.1.1.1\nnameserver 8.8.8.8\nsearch corp.local"},
+		{Content: "default via 192.168.1.1 dev eth0"},
+	}
+
+	content := buildPass2Content("dns is broken", recipe, toolCalls, toolResults)
+	assert.Contains(t, content, "Use this compact evidence bundle")
+	assert.Contains(t, content, "Recipe: dns_resolution")
+	assert.Contains(t, content, "Nameservers")
+	assert.Contains(t, content, "Default route")
+	assert.NotContains(t, content, "I ran `")
 }
