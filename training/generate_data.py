@@ -1383,6 +1383,421 @@ sda     245.00  89.00   12800   4560    85.23  98.7""", "call_2"),
 ]})
 
 
+# ── Docker crash analysis examples ─────────────────────────────────────
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("my redis container keeps crashing"),
+    asst("Let me inspect the Redis container to check its state and logs."),
+    asst_tc([tc("bash", {"command": "docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' redis"})]),
+    tr("exited exit:137 oom:true"),
+    asst_tc([tc("bash", {"command": "docker logs --tail 40 redis 2>&1"}, "call_2")]),
+    tr("1:M 01 Apr 2026 14:23:45.123 # Out of memory allocating 4096 bytes!\n1:M 01 Apr 2026 14:23:45.124 # Redis is being killed by OOM killer", "call_2"),
+    asst("""**Summary**: Redis container killed by OOM — exceeded memory limit.
+
+**Root Cause**: The container was killed by the OOM killer (exit code 137, OOMKilled=true). Redis attempted to allocate memory beyond the container's limit.
+
+**Risk Level**: Critical — data loss possible if persistence is not configured.
+
+**Evidence**: `docker inspect` shows exit:137, oom:true. Logs confirm out-of-memory allocation failure.
+
+**Remediation**:
+1. Increase the container memory limit: `docker update --memory 2g redis`
+2. Configure Redis `maxmemory` and eviction policy in redis.conf
+3. Monitor memory usage: `docker stats redis`
+4. Restart: `docker restart redis`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("my-app container won't start"),
+    asst("Let me check the container status and recent logs."),
+    asst_tc([tc("bash", {"command": "docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' my-app"})]),
+    tr("exited exit:1 oom:false"),
+    asst_tc([tc("bash", {"command": "docker logs --tail 40 my-app 2>&1"}, "call_2")]),
+    tr("Error: required environment variable DATABASE_URL is not set\nfatal: cannot connect to database", "call_2"),
+    asst("""**Summary**: my-app container fails to start due to missing environment variable.
+
+**Root Cause**: The application requires `DATABASE_URL` to be set but it is not present in the container's environment. Exit code 1 indicates a startup failure.
+
+**Risk Level**: High — service is completely down.
+
+**Evidence**: `docker inspect` shows exit:1, no OOM. Logs show "required environment variable DATABASE_URL is not set".
+
+**Remediation**:
+1. Set the missing environment variable: `docker run -e DATABASE_URL=postgres://... my-app`
+2. Or add it to your docker-compose.yml environment section
+3. Verify all required env vars are documented and set
+4. Restart: `docker start my-app`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("docker compose services failing"),
+    asst("Let me list all containers to see which ones are failing."),
+    asst_tc([tc("bash", {"command": "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -20"})]),
+    tr("NAMES\tSTATUS\tIMAGE\nweb\tExited (1) 2 hours ago\tnginx:latest\napi\tUp 3 hours\tapp:v2\ndb\tUp 3 hours\tpostgres:15\nworker\tRestarting (1) 5 seconds ago\tapp:v2"),
+    asst_tc([tc("bash", {"command": "docker logs --tail 20 web 2>&1"}, "call_2")]),
+    tr("2026/04/01 error: upstream connect failed: connection refused to api:8080\nnginx: configuration test failed", "call_2"),
+    asst("""**Summary**: 2 of 4 compose services are unhealthy — web exited, worker restart-looping.
+
+**Root Cause**: The `web` (nginx) container can't connect to `api:8080` upstream, likely a misconfigured proxy_pass or timing issue. The `worker` is in a restart loop (exit code 1).
+
+**Risk Level**: High — partial outage affecting web traffic.
+
+**Evidence**: `docker ps -a` shows web=Exited(1), worker=Restarting. `docker logs web` shows "upstream connect failed: connection refused".
+
+**Remediation**:
+1. Check nginx config: `docker exec web nginx -t` (after restarting)
+2. Verify the api service is listening on port 8080: `docker logs api`
+3. Check worker logs: `docker logs worker`
+4. Restart failing services: `docker compose restart web worker`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("container keeps restarting"),
+    asst("Let me check which containers are restarting and why."),
+    asst_tc([tc("bash", {"command": "docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -20"})]),
+    tr("NAMES\tSTATUS\tIMAGE\nmy-app\tRestarting (1) 3 seconds ago\tapp:latest\nredis\tUp 2 days\tredis:7"),
+    asst_tc([tc("bash", {"command": "docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' my-app"}, "call_2")]),
+    tr("restarting exit:1 oom:false", "call_2"),
+    asst_tc([tc("bash", {"command": "docker logs --tail 30 my-app 2>&1"}, "call_3")]),
+    tr("Error: listen EADDRINUSE: address already in use :::3000\nfatal: could not bind to port 3000", "call_3"),
+    asst("""**Summary**: my-app container is restart-looping due to port 3000 conflict.
+
+**Root Cause**: Port 3000 is already in use inside or outside the container, causing the application to fail on startup with `EADDRINUSE`. The restart policy keeps retrying.
+
+**Risk Level**: Critical — service is completely unavailable.
+
+**Evidence**: Container status: Restarting (exit 1). Logs show "EADDRINUSE: address already in use :::3000".
+
+**Remediation**:
+1. Find what's using port 3000: `docker ps` or `lsof -i :3000`
+2. Stop the conflicting container or change the port mapping
+3. If host port conflict: change `-p 3000:3000` to `-p 3001:3000`
+4. Restart: `docker restart my-app`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+# ── Build tool failure examples ────────────────────────────────────────
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("npm install failing"),
+    asst("Let me run npm install and check the error output."),
+    asst_tc([tc("bash", {"command": "npm run build 2>&1 | tail -40"})]),
+    tr("""npm ERR! code ERESOLVE
+npm ERR! ERESOLVE unable to resolve dependency tree
+npm ERR!
+npm ERR! While resolving: my-app@1.0.0
+npm ERR! Found: react@18.2.0
+npm ERR! peer dep conflict: react-dom@17.0.2 requires react@^17.0.0"""),
+    asst("""**Summary**: npm build fails due to dependency resolution conflict between react@18 and react-dom@17.
+
+**Root Cause**: `react-dom@17.0.2` requires `react@^17.0.0` but `react@18.2.0` is installed. This peer dependency conflict prevents the dependency tree from resolving.
+
+**Risk Level**: High — build is completely blocked.
+
+**Evidence**: npm ERR! ERESOLVE — peer dep conflict between react@18.2.0 and react-dom@17.0.2.
+
+**Remediation**:
+1. Upgrade react-dom to match: `npm install react-dom@18`
+2. Or use --legacy-peer-deps: `npm install --legacy-peer-deps` (temporary fix)
+3. Run `npm ls react react-dom` to see the full dependency tree
+4. Update package.json to use compatible versions
+
+**Rollback**: `git checkout package.json package-lock.json && npm install`""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("go build errors"),
+    asst("Let me run the Go build and check for errors."),
+    asst_tc([tc("bash", {"command": "go build ./... 2>&1 | tail -40"})]),
+    tr("""./cmd/server/main.go:15:2: undefined: handler.NewRouter
+./cmd/server/main.go:22:8: imported and not used: "fmt"
+./internal/api/routes.go:8:5: syntax error: unexpected newline"""),
+    asst("""**Summary**: Go build fails with 3 errors — undefined reference, unused import, and syntax error.
+
+**Root Cause**: Multiple issues: `handler.NewRouter` is undefined (likely renamed or moved), unused `fmt` import, and a syntax error in routes.go.
+
+**Risk Level**: Medium — build blocked but errors are straightforward to fix.
+
+**Evidence**: `go build ./...` shows 3 compilation errors across 2 files.
+
+**Remediation**:
+1. Fix `handler.NewRouter` — check if it was renamed: `grep -r "func New" internal/handler/`
+2. Remove unused import on line 22 of main.go
+3. Fix syntax error on line 8 of routes.go — check for missing comma or bracket
+4. Re-run: `go build ./...`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("cargo build failed"),
+    asst("Let me check the Rust build output."),
+    asst_tc([tc("bash", {"command": "cargo build 2>&1 | tail -40"})]),
+    tr("""error[E0308]: mismatched types
+  --> src/main.rs:10:5
+   |
+10 |     x
+   |     ^ expected `String`, found `&str`
+error[E0425]: cannot find value `config` in this scope
+  --> src/main.rs:15:10
+   |
+15 |     dbg!(config);
+   |          ^^^^^^ not found in this scope
+
+error: could not compile `my-project` (bin "my-project") due to 2 previous errors"""),
+    asst("""**Summary**: Cargo build fails with 2 errors — type mismatch and undefined variable.
+
+**Root Cause**: Line 10 returns `&str` where `String` is expected (use `.to_string()`). Line 15 references `config` which is not in scope.
+
+**Risk Level**: Medium — standard compilation errors.
+
+**Evidence**: `cargo build` shows error[E0308] mismatched types and error[E0425] cannot find value.
+
+**Remediation**:
+1. Line 10: convert `x` to String with `x.to_string()` or change the return type to `&str`
+2. Line 15: define `config` before use, or pass it as a parameter
+3. Re-run: `cargo build`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("npm run build fails with webpack error"),
+    asst("Let me check the build output."),
+    asst_tc([tc("bash", {"command": "npm run build 2>&1 | tail -40"})]),
+    tr("""Module not found: Error: Can't resolve './components/Dashboard' in '/app/src'
+ERROR in ./src/App.tsx
+Module not found: Error: Can't resolve '@/utils/helpers' in '/app/src'"""),
+    asst("""**Summary**: Webpack build fails — 2 missing module imports.
+
+**Root Cause**: Two imports cannot be resolved: `./components/Dashboard` (likely renamed or deleted) and `@/utils/helpers` (path alias may not be configured).
+
+**Risk Level**: High — build is completely blocked.
+
+**Evidence**: webpack shows "Module not found" for Dashboard component and helpers utility.
+
+**Remediation**:
+1. Check if Dashboard was moved: `find src -name 'Dashboard*'`
+2. Verify path alias `@/` is configured in tsconfig.json or webpack.config.js
+3. Fix the import paths in App.tsx
+4. Re-run: `npm run build`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("go test failing"),
+    asst("Let me run the tests and check the output."),
+    asst_tc([tc("bash", {"command": "go test ./... 2>&1 | tail -40"})]),
+    tr("""--- FAIL: TestUserCreate (0.02s)
+    user_test.go:45: expected status 201, got 400
+    user_test.go:48: response body: {"error":"email is required"}
+FAIL
+FAIL	github.com/example/api/internal/user	0.234s
+ok  	github.com/example/api/internal/auth	0.112s
+ok  	github.com/example/api/internal/db	0.089s"""),
+    asst("""**Summary**: 1 test failing in user package — TestUserCreate expects 201 but gets 400.
+
+**Root Cause**: TestUserCreate is sending a request without a required `email` field, causing a 400 validation error instead of the expected 201 creation response.
+
+**Risk Level**: Medium — 1 of 3 packages failing, likely a test data issue.
+
+**Evidence**: `go test ./...` shows FAIL in user package. Error: "email is required" — test fixture is missing required field.
+
+**Remediation**:
+1. Update TestUserCreate test data to include an email field
+2. Or check if a new validation rule was added that the test doesn't account for
+3. Re-run: `go test ./internal/user/ -v -run TestUserCreate`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("make fails"),
+    asst("Let me check the Makefile build output."),
+    asst_tc([tc("bash", {"command": "make 2>&1 | tail -40"})]),
+    tr("""gcc -o build/main src/main.c -I/usr/local/include -lssl -lcrypto
+/usr/bin/ld: cannot find -lssl: No such file or directory
+/usr/bin/ld: cannot find -lcrypto: No such file or directory
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:12: build/main] Error 1"""),
+    asst("""**Summary**: Make build fails — linker cannot find OpenSSL libraries (-lssl, -lcrypto).
+
+**Root Cause**: The OpenSSL development libraries are not installed on this system. The linker (`ld`) cannot find `libssl` and `libcrypto`.
+
+**Risk Level**: High — build is blocked until dependencies are installed.
+
+**Evidence**: `make` shows linker errors: "cannot find -lssl" and "cannot find -lcrypto".
+
+**Remediation**:
+1. Install OpenSSL dev libraries:
+   - Debian/Ubuntu: `sudo apt install libssl-dev`
+   - RHEL/Fedora: `sudo dnf install openssl-devel`
+   - macOS: `brew install openssl` and set `LDFLAGS=-L/usr/local/opt/openssl/lib`
+2. Re-run: `make clean && make`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+# ── Multi-step diagnostic examples ─────────────────────────────────────
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("my macOS service myapp keeps crashing"),
+    asst("Let me check the service status and recent logs on macOS."),
+    asst_tc([tc("bash", {"command": "launchctl list | grep -i myapp"})]),
+    tr("-\t78\tcom.example.myapp"),
+    asst("Service shows exit code 78 (not running). Let me check the system logs."),
+    asst_tc([tc("bash", {"command": "log show --predicate 'process == \"myapp\"' --last 5m --style compact 2>/dev/null | tail -40"}, "call_2")]),
+    tr("""2026-04-01 14:20:01 myapp[456]: error: failed to bind port 8080
+2026-04-01 14:20:01 myapp[456]: fatal: address already in use
+2026-04-01 14:20:02 myapp[456]: shutting down""", "call_2"),
+    asst_tc([tc("bash", {"command": "lsof -i :8080 | head -5"}, "call_3")]),
+    tr("""COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node    12345 user   21u  IPv4  45678      0t0  TCP *:8080 (LISTEN)""", "call_3"),
+    asst("""**Summary**: myapp cannot start because port 8080 is already in use by a Node.js process (PID 12345).
+
+**Root Cause**: Port 8080 is occupied by `node` (PID 12345). When myapp tries to bind to the same port, it gets "address already in use" and exits with code 78.
+
+**Risk Level**: Critical — service is completely down.
+
+**Evidence**: `launchctl list` shows exit code 78. Logs confirm "address already in use" on port 8080. `lsof` shows node PID 12345 is the listener.
+
+**Remediation**:
+1. Stop the conflicting process: `kill 12345` (or `kill -9 12345` if unresponsive)
+2. Or change myapp's port in its configuration
+3. Restart the service: `launchctl kickstart -k gui/$(id -u)/com.example.myapp`
+4. Verify: `launchctl list | grep myapp`
+
+**Rollback**: If you killed the node process, restart it if needed.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("server is running very slow, high CPU"),
+    asst("Let me check the system load and identify top CPU consumers."),
+    asst_tc([tc("bash", {"command": "uptime"})]),
+    tr(" 14:23:05 up 42 days,  3:15,  2 users,  load average: 12.50, 10.20, 8.75"),
+    asst("Load average is extremely high (12.5). Let me find the CPU-heavy processes."),
+    asst_tc([tc("bash", {"command": "ps aux --sort=-%cpu | head -10"}, "call_2")]),
+    tr("""USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root      5678 95.0  5.0 234567  8901 ?        R    Mar05  567:89 /usr/bin/stress --cpu 8
+www-data  1234 45.0  3.4 3456789 12345 ?       S    Mar06 1234:56 /usr/sbin/apache2 -DFOREGROUND
+root         1  0.0  0.0 169328 13156 ?        Ss   Mar05   0:09 /sbin/init""", "call_2"),
+    asst("""**Summary**: Extreme CPU load (12.5) caused by `stress --cpu 8` running since March 5th.
+
+**Root Cause**: A `stress` command (PID 5678) is consuming 95% CPU and has been running for over 500 hours. This is either a forgotten stress test or an unauthorized process. Apache is also at 45% CPU.
+
+**Risk Level**: Critical — load average 12.5 is severely degrading system performance.
+
+**Evidence**: `uptime` load avg 12.50/10.20/8.75 (all rising). `ps aux` shows stress at 95% CPU, apache at 45%.
+
+**Remediation**:
+1. Kill the stress test: `sudo kill 5678`
+2. Verify load drops: `watch uptime`
+3. Investigate apache's 45% CPU — check access logs for unusual traffic
+4. Set up monitoring alerts for high CPU to catch this earlier
+
+**Rollback**: If stress was intentional, restart it: `/usr/bin/stress --cpu 8`""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("DNS not resolving on this machine"),
+    asst("Let me check the DNS configuration and routing."),
+    asst_tc([tc("bash", {"command": "cat /etc/resolv.conf"})]),
+    tr("# Generated by NetworkManager\nnameserver 192.168.1.1"),
+    asst("Only one nameserver configured. Let me test if it responds and check the default route."),
+    asst_tc([tc("bash", {"command": "ip route"}, "call_2")]),
+    tr("default via 192.168.1.1 dev eth0 proto dhcp metric 100\n192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.50", "call_2"),
+    asst_tc([tc("bash", {"command": "timeout 3 nslookup google.com 192.168.1.1 2>&1"}, "call_3")]),
+    tr(";; connection timed out; no servers could be reached", "call_3"),
+    asst_tc([tc("bash", {"command": "timeout 3 nslookup google.com 8.8.8.8 2>&1"}, "call_4")]),
+    tr("Server:\t\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nNon-authoritative answer:\nName:\tgoogle.com\nAddress: 142.250.80.46", "call_4"),
+    asst("""**Summary**: DNS fails because the local resolver (192.168.1.1) is not responding, but external DNS (8.8.8.8) works fine.
+
+**Root Cause**: The configured nameserver at 192.168.1.1 (the default gateway/router) is not responding to DNS queries. External DNS (8.8.8.8) works, so the network is fine — only the local resolver is broken.
+
+**Risk Level**: High — all DNS resolution is failing on this machine.
+
+**Evidence**: `/etc/resolv.conf` has only `nameserver 192.168.1.1`. `nslookup` to 192.168.1.1 times out. `nslookup` to 8.8.8.8 succeeds.
+
+**Remediation**:
+1. Temporary fix — add a working nameserver: `echo 'nameserver 8.8.8.8' | sudo tee -a /etc/resolv.conf`
+2. Or use systemd-resolved: `sudo systemctl restart systemd-resolved`
+3. Check the router at 192.168.1.1 — its DNS service may have crashed
+4. Long-term: configure two nameservers for redundancy
+
+**Rollback**: Remove the added nameserver line from /etc/resolv.conf.""")
+]})
+
+# ── Stderr-aware examples ──────────────────────────────────────────────
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("getting errors when running my Python script"),
+    asst("Let me run the script and check the output."),
+    asst_tc([tc("bash", {"command": "python3 app.py 2>&1"})]),
+    tr("Processing data...\nLoaded 1500 records\n<stderr>\nTraceback (most recent call last):\n  File \"app.py\", line 42, in process\n    result = data['missing_key']\nKeyError: 'missing_key'\n</stderr>\nExit code 1"),
+    asst("""**Summary**: Python script crashes with KeyError on line 42 — accessing non-existent dictionary key.
+
+**Root Cause**: The script processes 1500 records but crashes when accessing `data['missing_key']` — the key doesn't exist in the data dictionary. This is likely a data format change or missing field.
+
+**Risk Level**: Medium — script crashes mid-processing.
+
+**Evidence**: stdout shows "Loaded 1500 records" (data loads OK). stderr shows KeyError: 'missing_key' at app.py:42.
+
+**Remediation**:
+1. Use `.get()` with a default: `data.get('missing_key', default_value)`
+2. Or add a key check: `if 'missing_key' in data:`
+3. Check if the data source changed its format recently
+4. Re-run: `python3 app.py`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+EXAMPLES.append({"messages": [
+    sys(),
+    user("build command has mixed output, can't tell what's wrong"),
+    asst("Let me run the build and separate stdout from stderr."),
+    asst_tc([tc("bash", {"command": "gcc -o myapp main.c 2>&1"})]),
+    tr("<stderr>\nmain.c:5:10: fatal error: 'openssl/ssl.h' file not found\n#include <openssl/ssl.h>\n         ^~~~~~~~~~~~~~~\n1 error generated.\n</stderr>\nExit code 1"),
+    asst("""**Summary**: GCC build fails — missing OpenSSL header file.
+
+**Root Cause**: The compiler cannot find `openssl/ssl.h`. The OpenSSL development headers are not installed on this system.
+
+**Risk Level**: High — build is completely blocked.
+
+**Evidence**: stderr shows `fatal error: 'openssl/ssl.h' file not found` with exit code 1.
+
+**Remediation**:
+1. Install OpenSSL headers:
+   - macOS: `brew install openssl && export CPATH=/usr/local/opt/openssl/include`
+   - Debian/Ubuntu: `sudo apt install libssl-dev`
+   - RHEL/Fedora: `sudo dnf install openssl-devel`
+2. Re-run: `gcc -o myapp main.c -lssl -lcrypto`
+
+**Rollback**: Diagnostic only — no changes made.""")
+]})
+
+
 def write_training_data(examples, output_path):
     """Write examples to JSONL file for mlx-lm LoRA training."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1426,6 +1841,9 @@ if __name__ == "__main__":
             categories["Windows"] += 1
         elif "docker" in user_msg.lower() or "container" in user_msg.lower():
             categories["Docker/containers"] += 1
+        elif any(kw in user_msg.lower() for kw in ["npm", "cargo", "go build", "go test", "webpack", "make", "build", "gcc", "compile"]):
+            categories.setdefault("Build tools", 0)
+            categories["Build tools"] += 1
         elif any(kw in user_msg.lower() for kw in ["dns", "port", "network", "ssl", "certificate", "firewall", "wifi", "route", "ping", "tcp", "udp", "ssh"]):
             categories["Networking"] += 1
         elif "security" in user_msg.lower() or "secure" in user_msg.lower() or "brute" in user_msg.lower():

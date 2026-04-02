@@ -118,6 +118,42 @@ func TestBashEmptyCommand(t *testing.T) {
 	assert.True(t, resp.IsError, "empty command should produce an error response")
 }
 
+func TestFormatBashOutput_StdoutOnly(t *testing.T) {
+	result := formatBashOutput("hello world", "", 0, false)
+	assert.Equal(t, "hello world", result)
+	assert.NotContains(t, result, "<stderr>")
+}
+
+func TestFormatBashOutput_StderrOnly(t *testing.T) {
+	result := formatBashOutput("", "some warning", 0, false)
+	assert.Equal(t, "<stderr>\nsome warning\n</stderr>", result)
+}
+
+func TestFormatBashOutput_Both(t *testing.T) {
+	result := formatBashOutput("stdout line", "stderr line", 0, false)
+	assert.Equal(t, "stdout line\n<stderr>\nstderr line\n</stderr>", result)
+}
+
+func TestFormatBashOutput_ExitCode(t *testing.T) {
+	result := formatBashOutput("output", "", 1, false)
+	assert.Equal(t, "output\nExit code 1", result)
+}
+
+func TestFormatBashOutput_Interrupted(t *testing.T) {
+	result := formatBashOutput("partial", "", 0, true)
+	assert.Equal(t, "partial\nCommand was aborted before completion", result)
+}
+
+func TestFormatBashOutput_StderrAndExitCode(t *testing.T) {
+	result := formatBashOutput("", "error msg", 2, false)
+	assert.Equal(t, "<stderr>\nerror msg\n</stderr>\nExit code 2", result)
+}
+
+func TestFormatBashOutput_Empty(t *testing.T) {
+	result := formatBashOutput("", "", 0, false)
+	assert.Equal(t, "", result)
+}
+
 func TestBashMissingContextValues(t *testing.T) {
 	tool := NewBashTool(nil)
 	// Use a bare context without session/message IDs
