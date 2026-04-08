@@ -2,17 +2,34 @@ package diagnose
 
 import "fmt"
 
+type IssueClass string
+
+const (
+	IssueGeneral     IssueClass = "general"
+	IssueDisk        IssueClass = "disk"
+	IssueMemory      IssueClass = "memory"
+	IssuePerformance IssueClass = "performance"
+	IssueService     IssueClass = "service"
+	IssueDNS         IssueClass = "dns"
+	IssueNetwork     IssueClass = "network"
+	IssueDocker      IssueClass = "docker"
+	IssueBuild       IssueClass = "build"
+)
+
 func BuildDiagnosePrompt(userError string) string {
-	facts := CollectFacts()
+	issueClass := ClassifyIssue(userError)
+	facts := CollectFactsForIssue(issueClass)
 	factsStr := Format(facts)
 
 	return fmt.Sprintf(`The user is reporting the following issue:
 > %s
+
+Issue class: %s
 
 Below are automatically collected system facts. Use these as your starting point for diagnosis.
 Do NOT re-run commands whose output is already provided below unless you need fresher data.
 
 %s
 
-Please diagnose this issue following the structured format: Summary, Root Cause, Risk Level, Evidence, Remediation, Rollback.`, userError, factsStr)
+Please diagnose this issue following the structured format: Summary, Root Cause, Risk Level, Evidence, Remediation, Rollback.`, userError, issueClass, factsStr)
 }

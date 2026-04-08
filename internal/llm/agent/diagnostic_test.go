@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/opencode-ai/opencode/internal/diagnose"
 	"github.com/opencode-ai/opencode/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -111,6 +113,45 @@ func TestTryStructuredDiagnostic_MultipleToolCalls(t *testing.T) {
 	toolResults := []message.ToolResult{{Content: "some output"}}
 	_, ok := tryStructuredDiagnostic(toolCalls, toolResults)
 	assert.False(t, ok)
+}
+
+func TestTryStructuredRecipeDiagnostic_ServiceFailure(t *testing.T) {
+	recipe := diagnose.SelectRecipe("nginx won't start")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"systemctl status nginx --no-pager --full -n 20"}`},
+		{Name: "bash", Input: `{"command":"journalctl -u nginx -n 40 --no-pager"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "Loaded: loaded (/usr/lib/systemd/system/nginx.service)\nActive: failed (Result: exit-code)\nMain PID: 1234 (code=exited, status=1/FAILURE)"},
+		{Content: "Apr 01 nginx[1234]: bind() to 0.0.0.0:80 failed (98: Address already in use)\nApr 01 systemd[1]: nginx.service: Failed with result 'exit-code'."},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "nginx is failing to start due to port conflict")
+	assert.Contains(t, result, "Address already in use")
+}
+
+func TestTryStructuredRecipeDiagnostic_DNSResolution(t *testing.T) {
+	recipe := diagnose.SelectRecipe("dns resolution is broken")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"cat /etc/resolv.conf"}`},
+		{Name: "bash", Input: `{"command":"ip route"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "nameserver 1.1.1.1\nsearch corp.local"},
+		{Content: "default via 192.168.1.1 dev eth0"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "DNS and routing look present")
+	assert.Contains(t, result, "Nameservers")
+	assert.Contains(t, result, "Default route")
 }
 
 // --- Disk Usage ---
@@ -545,9 +586,9 @@ func TestParseEtcFile(t *testing.T) {
 
 func TestDiagnosticResult_Render(t *testing.T) {
 	d := DiagnosticResult{
-		Summary:   "Test summary",
-		RiskLevel: "High",
-		Findings:  []string{"Finding 1", "Finding 2"},
+		Summary:     "Test summary",
+		RiskLevel:   "High",
+		Findings:    []string{"Finding 1", "Finding 2"},
 		Remediation: []string{"Fix 1", "Fix 2"},
 	}
 	result := d.Render()
@@ -582,7 +623,7 @@ func TestParseSize(t *testing.T) {
 		{"15Gi", 15 * 1024},
 		{"8.2Gi", 8.2 * 1024},
 		{"2.0Gi", 2.0 * 1024},
-		{"16384", 16384},       // plain number = MB
+		{"16384", 16384}, // plain number = MB
 		{"512Mi", 512},
 		{"1.5G", 1.5 * 1024},
 		{"100K", 100.0 / 1024},
@@ -625,4 +666,513 @@ func TestTryStructuredDiagnostic_FreeRoundtrip(t *testing.T) {
 	require.True(t, ok)
 	assert.Contains(t, result, "**Summary**")
 	assert.Contains(t, result, "RAM:")
+}
+
+// --- Edge case tests ---
+
+func TestParseDiskUsage_SpacesInFilesystem(t *testing.T) {
+	// LVM or device-mapper names with many fields before the percentage
+	input := `Filesystem                        Size  Used Avail Use% Mounted on
+/dev/mapper/vg--data-lv--app      200G  180G   20G  90% /opt/app
+tmpfs                             7.8G     0  7.8G   0% /dev/shm`
+	result, ok := parseDiskUsage(input)
+	require.True(t, ok)
+	assert.Contains(t, result, "90%")
+	assert.Contains(t, result, "/opt/app")
+}
+
+func TestParseDiskUsage_Truncated(t *testing.T) {
+	// Only header, no data rows
+	input := `Filesystem      Size  Used Avail Use% Mounted on`
+	_, ok := parseDiskUsage(input)
+	assert.False(t, ok)
+}
+
+func TestParseMemory_TruncatedOnlyHeader(t *testing.T) {
+	input := `               total        used        free      shared  buff/cache   available`
+	_, ok := parseMemory(input)
+	assert.False(t, ok)
+}
+
+func TestParseTop_TruncatedFewLines(t *testing.T) {
+	// Fewer than 5 lines — Linux parser should reject
+	input := `top - 10:00:00 up 1 day
+Tasks: 100 total
+%Cpu(s):  5.0 us`
+	_, ok := parseTop(input)
+	assert.False(t, ok)
+}
+
+const macTopOutput = `Processes: 879 total, 4 running, 875 sleeping, 3204 threads                                           14:23:05
+Load Avg: 2.93, 3.78, 3.89  CPU usage: 7.10% user, 8.80% sys, 84.18% idle
+SharedLibs: 894M resident, 134M data, 79M linkedit.
+MemRegions: 567890 total, 12G resident, 398M private, 2.1G shared.
+PhysMem: 61G used (5548M wired, 537M compressor), 66G unused.
+VM: 123T vsize, 4200M framework vsize, 0(0) swapins, 0(0) swapouts.
+Networks: packets: 12345678/9G in, 8765432/5G out.
+Disks: 1234567/45G read, 2345678/78G written.
+
+PID    COMMAND      %CPU TIME     #TH   #WQ  #PORT MEM    PURG   CMPRS  PGRP  PPID  STATE
+12345  firefox      45.2 12:34.56 123   12   456   1234M  0B     890M   12345 1     running
+67890  Xorg         12.3 05:67.89 45    3    789   567M   0B     123M   67890 1     sleeping`
+
+func TestParseTop_MacOS(t *testing.T) {
+	result, ok := parseTop(macTopOutput)
+	require.True(t, ok)
+
+	assert.Contains(t, result, "CPU usage at 15.9%") // 7.1 + 8.8
+	assert.Contains(t, result, "879 total, 4 running")
+	assert.Contains(t, result, "7.1% user")
+	assert.Contains(t, result, "61G used, 66G unused")
+	assert.Contains(t, result, "Load Avg: 2.93 (1m)")
+	assert.Contains(t, result, "**Risk Level**: Low")
+}
+
+func TestTryStructuredRecipeDiagnostic_DiskUsage(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeDiskUsage,
+		IssueClass: diagnose.IssueDisk,
+	}
+
+	// Two tool results: df + du
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"df -h"}`},
+		{Name: "bash", Input: `{"command":"du -xhd 1 / 2>/dev/null | sort -hr | head -15"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: dfLinuxOutput},
+		{Content: "376G\t/home\n42G\t/var\n12G\t/usr\n8.0G\t/opt"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "87%")
+	assert.Contains(t, result, "Top space consumers")
+	assert.Contains(t, result, "376G")
+}
+
+func TestTryStructuredRecipeDiagnostic_MemoryPressure(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeMemoryPressure,
+		IssueClass: diagnose.IssueMemory,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"free -h"}`},
+		{Name: "bash", Input: `{"command":"ps aux --sort=-%mem | head -10"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: freeHumanOutput},
+		{Content: "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot      1234 10.0 25.0 3456789 12345 ?       Sl   Mar06 1234:56 /usr/bin/java"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "Memory usage at")
+	assert.Contains(t, result, "Top memory consumers")
+	assert.Contains(t, result, "java")
+}
+
+func TestTryStructuredRecipeDiagnostic_PerformanceCPU(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipePerformanceCPU,
+		IssueClass: diagnose.IssuePerformance,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"uptime"}`},
+		{Name: "bash", Input: `{"command":"ps aux --sort=-%cpu | head -10"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: " 14:23:05 up 42 days,  3:15,  2 users,  load average: 1.23, 0.98, 0.76"},
+		{Content: "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot      5678 95.0  5.0 234567  8901 ?        R    Mar05  567:89 stress --cpu 8"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "42 days")
+	assert.Contains(t, result, "Top CPU consumers")
+	assert.Contains(t, result, "stress")
+}
+
+func TestParseProcesses_HighCPUSorted(t *testing.T) {
+	input := `USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+nobody    9999  0.1  0.1  12345  2345 ?        S    Mar10   0:01 /usr/sbin/dnsmasq
+user      1234 85.0  3.4 3456789 12345 ?       Sl   Mar06 1234:56 /usr/bin/stress
+root      5678 45.0  2.1 234567  8901 ?        Ss   Mar05  567:89 /usr/lib/xorg/Xorg
+root         1  0.0  0.0 169328 13156 ?        Ss   Mar05   0:09 /sbin/init`
+
+	result, ok := parseProcesses(input)
+	require.True(t, ok)
+
+	// Should be sorted by CPU descending
+	assert.Contains(t, result, "highest CPU: 85.0%")
+	assert.Contains(t, result, "**Risk Level**: High")
+
+	// Verify order: stress (85) before Xorg (45) before dnsmasq (0.1) before init (0)
+	lines := strings.Split(result, "\n")
+	var cpuValues []float64
+	for _, line := range lines {
+		if strings.HasPrefix(line, "- PID ") {
+			// Extract CPU value: "- PID 1234 (user): CPU 85.0%, MEM ..."
+			parts := strings.Split(line, "CPU ")
+			if len(parts) >= 2 {
+				pctStr := strings.Split(parts[1], "%")[0]
+				if cpu, err := strconv.ParseFloat(pctStr, 64); err == nil {
+					cpuValues = append(cpuValues, cpu)
+				}
+			}
+		}
+	}
+	// Verify descending order
+	for i := 1; i < len(cpuValues); i++ {
+		assert.GreaterOrEqual(t, cpuValues[i-1], cpuValues[i],
+			"processes should be sorted by CPU descending: %v", cpuValues)
+	}
+}
+
+// --- launchctl list parsing ---
+
+const launchctlListOutput = "PID\tStatus\tLabel\n389\t0\tcom.apple.runningsvr\n-\t127\tcom.apple.failedsvr\n12345\t0\tcom.apple.another"
+
+func TestParseLaunchctlList(t *testing.T) {
+	entries := parseLaunchctlList(launchctlListOutput)
+	require.Len(t, entries, 3)
+
+	assert.Equal(t, "389", entries[0].PID)
+	assert.Equal(t, 0, entries[0].ExitCode)
+	assert.Equal(t, "com.apple.runningsvr", entries[0].Label)
+
+	assert.Equal(t, "-", entries[1].PID)
+	assert.Equal(t, 127, entries[1].ExitCode)
+	assert.Equal(t, "com.apple.failedsvr", entries[1].Label)
+
+	assert.Equal(t, "12345", entries[2].PID)
+	assert.Equal(t, 0, entries[2].ExitCode)
+	assert.Equal(t, "com.apple.another", entries[2].Label)
+}
+
+func TestParseLaunchctlList_AllRunning(t *testing.T) {
+	input := "PID\tStatus\tLabel\n389\t0\tcom.apple.svc1\n456\t0\tcom.apple.svc2"
+	entries := parseLaunchctlList(input)
+	require.Len(t, entries, 2)
+	for _, e := range entries {
+		assert.Equal(t, 0, e.ExitCode)
+	}
+}
+
+func TestParseLaunchctlList_Empty(t *testing.T) {
+	// Header only
+	entries := parseLaunchctlList("PID\tStatus\tLabel\n")
+	assert.Empty(t, entries)
+}
+
+// --- macOS service failure recipe ---
+
+const launchctlGrepOutput = "-\t78\tcom.example.myapp"
+
+const logShowOutput = `2026-04-01 14:23:45.123 myapp[123]: error: failed to bind port 8080
+2026-04-01 14:23:46.234 myapp[123]: fatal: address already in use
+2026-04-01 14:23:47.345 myapp[123]: shutting down`
+
+func TestParseServiceFailureRecipe_MacOS_WithLogs(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeServiceFailure,
+		IssueClass:  diagnose.IssueService,
+		ServiceName: "myapp",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | grep -i 'myapp'"}`},
+		{Name: "bash", Input: `{"command":"log show --predicate 'process == \"myapp\"' --last 5m --style compact 2>/dev/null | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: launchctlGrepOutput},
+		{Content: logShowOutput},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "port conflict")
+	assert.Contains(t, result, "address already in use")
+	assert.Contains(t, result, "Critical")
+	assert.Contains(t, result, "launchctl list | grep -i myapp")
+}
+
+func TestParseServiceFailureRecipe_MacOS_ListOnly(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeServiceFailure,
+		IssueClass: diagnose.IssueService,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | head -50"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: launchctlListOutput},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "non-zero exit codes")
+	assert.Contains(t, result, "com.apple.failedsvr")
+	assert.Contains(t, result, "exit code 127")
+	assert.Contains(t, result, "High")
+}
+
+func TestParseServiceFailureRecipe_MacOS_Running(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeServiceFailure,
+		IssueClass:  diagnose.IssueService,
+		ServiceName: "myapp",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"launchctl list | grep -i 'myapp'"}`},
+		{Name: "bash", Input: `{"command":"log show --predicate 'process == \"myapp\"' --last 5m --style compact 2>/dev/null | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "12345\t0\tcom.example.myapp"},
+		{Content: "2026-04-01 14:23:47.345 myapp[123]: normal operation"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "is running")
+	assert.Contains(t, result, "PID 12345")
+	assert.Contains(t, result, "Low")
+}
+
+func TestParseServiceFailureRecipe_Linux_Unchanged(t *testing.T) {
+	// Regression guard: existing Linux flow must still work identically.
+	recipe := diagnose.SelectRecipe("nginx won't start")
+	require.NotNil(t, recipe)
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"systemctl status nginx --no-pager --full -n 20"}`},
+		{Name: "bash", Input: `{"command":"journalctl -u nginx -n 40 --no-pager"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "Loaded: loaded (/usr/lib/systemd/system/nginx.service)\nActive: failed (Result: exit-code)\nMain PID: 1234 (code=exited, status=1/FAILURE)"},
+		{Content: "Apr 01 nginx[1234]: bind() to 0.0.0.0:80 failed (98: Address already in use)\nApr 01 systemd[1]: nginx.service: Failed with result 'exit-code'."},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "nginx is failing to start due to port conflict")
+	assert.Contains(t, result, "Address already in use")
+	assert.Contains(t, result, "systemctl status")
+}
+
+// --- stripStreamTags ---
+
+func TestStripStreamTags(t *testing.T) {
+	assert.Equal(t, "hello", stripStreamTags("hello"))
+	assert.Equal(t, "output\nerror line", stripStreamTags("output\n<stderr>\nerror line\n</stderr>"))
+	assert.Equal(t, "error line", stripStreamTags("<stderr>\nerror line\n</stderr>"))
+	assert.Equal(t, "just text", stripStreamTags("just text"))
+	assert.Equal(t, "", stripStreamTags(""))
+}
+
+// --- summarizeServiceProbe evidence handlers ---
+
+func TestSummarizeServiceProbe_LogShow(t *testing.T) {
+	cmd := `log show --predicate 'process == "myapp"' --last 5m --style compact`
+	output := "2026-04-01 14:23:45 myapp[123]: error: something broke\n2026-04-01 14:23:46 myapp[123]: fatal: address already in use\n2026-04-01 14:23:47 myapp[123]: normal line"
+
+	result := summarizeServiceProbe(cmd, output)
+	assert.Contains(t, result, "Recent service errors")
+	assert.Contains(t, result, "error: something broke")
+	assert.Contains(t, result, "address already in use")
+}
+
+func TestSummarizeServiceProbe_LaunchctlFailed(t *testing.T) {
+	cmd := "launchctl list | head -50"
+	output := "PID\tStatus\tLabel\n389\t0\tcom.apple.ok\n-\t127\tcom.apple.broken\n-\t78\tcom.example.dead"
+
+	result := summarizeServiceProbe(cmd, output)
+	assert.Contains(t, result, "Failed services")
+	assert.Contains(t, result, "127")
+	assert.Contains(t, result, "com.apple.broken")
+}
+
+// --- Docker crash recipe ---
+
+func TestParseDockerCrashRecipe_OOM(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "my-app",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'my-app'"}`},
+		{Name: "bash", Input: `{"command":"docker logs --tail 40 'my-app' 2>&1"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "exited exit:137 oom:true"},
+		{Content: "2026-04-01 app: processing request\n2026-04-01 app: fatal: out of memory\n2026-04-01 app: killed"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "OOM killed")
+	assert.Contains(t, result, "Critical")
+	assert.Contains(t, result, "memory")
+}
+
+func TestParseDockerCrashRecipe_ExitCode(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "web",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'web'"}`},
+		{Name: "bash", Input: `{"command":"docker logs --tail 40 'web' 2>&1"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "exited exit:1 oom:false"},
+		{Content: "Error: config file not found at /etc/app/config.yml"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "web crashed")
+	assert.Contains(t, result, "not found")
+	assert.Contains(t, result, "High")
+}
+
+func TestParseDockerCrashRecipe_Running(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeDockerCrash,
+		IssueClass:  diagnose.IssueDocker,
+		ServiceName: "redis",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker inspect --format '{{.State.Status}} exit:{{.State.ExitCode}} oom:{{.State.OOMKilled}}' 'redis'"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "running exit:0 oom:false"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "running normally")
+	assert.Contains(t, result, "Low")
+}
+
+func TestParseDockerCrashRecipe_ListOnly(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:       diagnose.RecipeDockerCrash,
+		IssueClass: diagnose.IssueDocker,
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -20"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "NAMES\tSTATUS\tIMAGE\nweb\tExited (1) 2 hours ago\tnginx\nredis\tUp 3 days\tredis:7\nworker\tRestarting (1) 5 seconds ago\tapp:latest"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "containers listed")
+	assert.Contains(t, result, "exited")
+	assert.Contains(t, result, "restarting")
+}
+
+func TestSummarizeDockerProbe(t *testing.T) {
+	result := summarizeDockerProbe("docker logs --tail 40 my-app", "error: connection refused\nfatal: cannot start\nnormal operation")
+	assert.Contains(t, result, "Container log errors")
+	assert.Contains(t, result, "connection refused")
+}
+
+// --- Build failure recipe ---
+
+func TestParseBuildFailureRecipe_Npm(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "npm",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"npm run build 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE unable to resolve dependency tree\nnpm ERR! peer dep conflict: react@18.2.0"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "npm build failed")
+	assert.Contains(t, result, "ERESOLVE")
+	assert.Contains(t, result, "error")
+}
+
+func TestParseBuildFailureRecipe_Go(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "go",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"go build ./... 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "./main.go:15:2: undefined: DoStuff\n./main.go:20:5: imported and not used: \"fmt\""},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "go build failed")
+	assert.Contains(t, result, "undefined")
+}
+
+func TestParseBuildFailureRecipe_Cargo(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "cargo",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"cargo build 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: "error[E0308]: mismatched types\n  --> src/main.rs:10:5\nerror[E0425]: cannot find value `x` in this scope\n  --> src/main.rs:15:10"},
+	}
+
+	result, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	require.True(t, ok)
+	assert.Contains(t, result, "cargo build failed")
+	assert.Contains(t, result, "error")
+}
+
+func TestParseBuildFailureRecipe_NoErrors(t *testing.T) {
+	recipe := &diagnose.Recipe{
+		Name:        diagnose.RecipeBuildFailure,
+		IssueClass:  diagnose.IssueBuild,
+		ServiceName: "go",
+	}
+
+	toolCalls := []message.ToolCall{
+		{Name: "bash", Input: `{"command":"go build ./... 2>&1 | tail -40"}`},
+	}
+	toolResults := []message.ToolResult{
+		{Content: ""},
+	}
+
+	_, ok := tryStructuredRecipeDiagnostic(recipe, toolCalls, toolResults)
+	assert.False(t, ok) // empty output falls through
+}
+
+func TestSummarizeBuildProbe(t *testing.T) {
+	result := summarizeBuildProbe("npm run build", "npm ERR! code ERESOLVE\nnpm ERR! peer dep conflict\nBuilding modules...")
+	assert.Contains(t, result, "build errors")
+	assert.Contains(t, result, "ERESOLVE")
 }

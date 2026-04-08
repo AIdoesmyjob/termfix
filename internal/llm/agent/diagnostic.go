@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/opencode-ai/opencode/internal/diagnose"
 	"github.com/opencode-ai/opencode/internal/message"
 )
 
@@ -55,7 +57,7 @@ func tryStructuredDiagnostic(toolCalls []message.ToolCall, toolResults []message
 		return "", false
 	}
 
-	output := toolResults[0].Content
+	output := stripStreamTags(toolResults[0].Content)
 	if toolResults[0].IsError || output == "" || strings.HasPrefix(output, "Error:") {
 		return "", false
 	}
@@ -93,6 +95,50 @@ func tryStructuredDiagnostic(toolCalls []message.ToolCall, toolResults []message
 	default:
 		return "", false
 	}
+}
+
+func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if recipe == nil || len(toolCalls) == 0 || len(toolResults) == 0 {
+		return "", false
+	}
+
+	// Strip stderr tags from all tool results before parsing
+	cleaned := make([]message.ToolResult, len(toolResults))
+	for i, tr := range toolResults {
+		cleaned[i] = tr
+		cleaned[i].Content = stripStreamTags(tr.Content)
+	}
+	toolResults = cleaned
+
+	switch recipe.Name {
+	case diagnose.RecipeServiceFailure:
+		return parseServiceFailureRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDNSResolution:
+		return parseDNSRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeNetworkConnectivity:
+		return parseNetworkRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDiskUsage:
+		return parseDiskUsageRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeMemoryPressure:
+		return parseMemoryPressureRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePerformanceCPU:
+		return parsePerformanceCPURecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDockerCrash:
+		return parseDockerCrashRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeBuildFailure:
+		return parseBuildFailureRecipe(recipe, toolCalls, toolResults)
+	default:
+		return "", false
+	}
+}
+
+// stripStreamTags removes <stderr>...</stderr> wrapper tags from tool output.
+func stripStreamTags(output string) string {
+	output = strings.ReplaceAll(output, "<stderr>\n", "")
+	output = strings.ReplaceAll(output, "\n</stderr>", "")
+	output = strings.ReplaceAll(output, "<stderr>", "")
+	output = strings.ReplaceAll(output, "</stderr>", "")
+	return output
 }
 
 // extractCommand parses the JSON input of a bash tool call to get the command string.
@@ -148,6 +194,454 @@ func detectCommandKey(command string) string {
 	return ""
 }
 
+func parseServiceFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	// Detect platform from the command in the first tool call.
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.Contains(cmd, "launchctl") {
+		return parseMacServiceFailure(recipe, toolCalls, toolResults)
+	}
+	return parseLinuxServiceFailure(recipe, toolCalls, toolResults)
+}
+
+func parseLinuxServiceFailure(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	statusOutput := toolResults[0].Content
+	logOutput := toolResults[1].Content
+	if strings.TrimSpace(statusOutput) == "" || strings.TrimSpace(logOutput) == "" {
+		return "", false
+	}
+
+	statusLines := grepLines(statusOutput, `(?i)(Active:|Loaded:|Main PID:|status=|failed)`)
+	errorLines := grepLines(logOutput, `(?i)(error|failed|fatal|panic|denied|permission|address already in use|exception|invalid|not found|refused)`)
+	if len(statusLines) == 0 && len(errorLines) == 0 {
+		return "", false
+	}
+
+	serviceName := recipe.ServiceName
+	if serviceName == "" {
+		serviceName = "service"
+	}
+	rootCause := detectRootCause(errorLines)
+
+	risk := "High"
+	if rootCause == "port conflict" || rootCause == "permission error" {
+		risk = "Critical"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s is failing to start due to %s", serviceName, rootCause),
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(statusLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+	for _, line := range firstN(errorLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	switch rootCause {
+	case "port conflict":
+		d.Remediation = append(d.Remediation, "Find the conflicting listener and free the port before restarting the service")
+	case "permission error":
+		d.Remediation = append(d.Remediation, "Fix the file, directory, or capability permissions the service needs at startup")
+	case "invalid configuration":
+		d.Remediation = append(d.Remediation, "Validate and correct the service configuration before restarting")
+	default:
+		d.Remediation = append(d.Remediation, "Review the recent service errors and fix the failing dependency or configuration")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Re-run `systemctl status %s --no-pager --full -n 20` after applying the fix", serviceName))
+	return d.Render(), true
+}
+
+func parseMacServiceFailure(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	serviceName := recipe.ServiceName
+	if serviceName == "" {
+		serviceName = "service"
+	}
+
+	// Case A — 1 result: launchctl list (no specific service name)
+	if len(toolResults) == 1 {
+		return parseMacServiceList(serviceName, toolResults[0].Content)
+	}
+
+	// Case B — 2 results: launchctl list | grep + log show
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	grepOutput := toolResults[0].Content
+	logOutput := toolResults[1].Content
+	if strings.TrimSpace(grepOutput) == "" {
+		return "", false
+	}
+
+	entries := parseLaunchctlList(grepOutput)
+
+	// Determine service state from launchctl grep
+	var pid string
+	var exitCode int
+	if len(entries) > 0 {
+		pid = entries[0].PID
+		exitCode = entries[0].ExitCode
+	}
+
+	// Parse log output for errors
+	errorLines := grepLines(logOutput, `(?i)(error|failed|fatal|panic|denied|permission|address already in use|exception|invalid|not found|refused)`)
+	rootCause := detectRootCause(errorLines)
+
+	// Service is running (has a PID and zero exit code)
+	if pid != "-" && pid != "" && exitCode == 0 {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s is running (PID %s)", serviceName, pid),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("PID: %s, exit code: %d", pid, exitCode))
+		if len(errorLines) > 0 {
+			for _, line := range firstN(errorLines, 4) {
+				d.Findings = append(d.Findings, line)
+			}
+			d.Remediation = append(d.Remediation, "Service is running but recent logs contain errors — monitor for recurrence")
+		}
+		return d.Render(), true
+	}
+
+	// Service is not running or has non-zero exit
+	risk := "High"
+	if rootCause == "port conflict" || rootCause == "permission error" {
+		risk = "Critical"
+	}
+
+	summary := fmt.Sprintf("%s is not running (exit code %d)", serviceName, exitCode)
+	if rootCause != "service failure" {
+		summary = fmt.Sprintf("%s is failing to start due to %s", serviceName, rootCause)
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("PID: %s, exit code: %d", pid, exitCode))
+	for _, line := range firstN(errorLines, 4) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	switch rootCause {
+	case "port conflict":
+		d.Remediation = append(d.Remediation, "Find the conflicting listener and free the port before restarting the service")
+	case "permission error":
+		d.Remediation = append(d.Remediation, "Fix the file, directory, or capability permissions the service needs at startup")
+	case "invalid configuration":
+		d.Remediation = append(d.Remediation, "Validate and correct the service configuration before restarting")
+	default:
+		d.Remediation = append(d.Remediation, "Review the recent service errors and fix the failing dependency or configuration")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Re-run `launchctl list | grep -i %s` after applying the fix", serviceName))
+	return d.Render(), true
+}
+
+// parseMacServiceList handles the case where launchctl list output (no specific service)
+// is the only tool result. Scans for services with non-zero exit codes.
+func parseMacServiceList(serviceName, output string) (string, bool) {
+	if strings.TrimSpace(output) == "" {
+		return "", false
+	}
+
+	entries := parseLaunchctlList(output)
+	if len(entries) == 0 {
+		return "", false
+	}
+
+	var failed []launchctlEntry
+	for _, e := range entries {
+		if e.ExitCode != 0 {
+			failed = append(failed, e)
+		}
+	}
+
+	if len(failed) == 0 {
+		d := DiagnosticResult{
+			Summary:   "All listed services running normally",
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("%d services checked, all with exit code 0", len(entries)))
+		return d.Render(), true
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%d service(s) with non-zero exit codes", len(failed)),
+		RiskLevel: "High",
+	}
+	for _, e := range firstN(failed, 8) {
+		d.Findings = append(d.Findings, fmt.Sprintf("%s — exit code %d (PID: %s)", e.Label, e.ExitCode, e.PID))
+	}
+	d.Remediation = append(d.Remediation, "Investigate failed services with `launchctl list | grep -i <service>` and check logs with `log show`")
+	return d.Render(), true
+}
+
+// detectRootCause scans error lines for common failure keywords and returns
+// a human-readable root cause string.
+func detectRootCause(errorLines []string) string {
+	rootCause := "service failure"
+	for _, line := range errorLines {
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "address already in use"):
+			rootCause = "port conflict"
+		case strings.Contains(lower, "permission denied") || strings.Contains(lower, "denied"):
+			rootCause = "permission error"
+		case strings.Contains(lower, "not found"):
+			rootCause = "missing dependency or file"
+		case strings.Contains(lower, "invalid"):
+			rootCause = "invalid configuration"
+		}
+		if rootCause != "service failure" {
+			break
+		}
+	}
+	return rootCause
+}
+
+func parseDNSRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	dnsOutput := toolResults[0].Content
+	routeOutput := toolResults[1].Content
+	if strings.TrimSpace(dnsOutput) == "" && strings.TrimSpace(routeOutput) == "" {
+		return "", false
+	}
+
+	nameservers := grepLines(dnsOutput, `(?i)(^nameserver\s+|nameserver\[[0-9]+\])`)
+	searchDomains := grepLines(dnsOutput, `(?i)^(search|domain)\s+`)
+	defaultRoutes := grepLines(routeOutput, `(?i)^(default|0\.0\.0\.0)`)
+	if len(nameservers) == 0 && len(defaultRoutes) == 0 {
+		return "", false
+	}
+
+	risk := "Low"
+	summary := "DNS and routing look present"
+	if len(nameservers) == 0 {
+		risk = "High"
+		summary = "No DNS nameservers found in resolver configuration"
+	} else if len(defaultRoutes) == 0 {
+		risk = "High"
+		summary = "DNS is configured but no default route is visible"
+	} else if len(searchDomains) == 0 {
+		risk = "Medium"
+		summary = "DNS nameservers are configured; verify resolution path and search domain needs"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	if len(nameservers) > 0 {
+		d.Findings = append(d.Findings, "Nameservers: "+strings.Join(firstN(nameservers, 3), "; "))
+	}
+	if len(searchDomains) > 0 {
+		d.Findings = append(d.Findings, "Search domains: "+strings.Join(firstN(searchDomains, 2), "; "))
+	}
+	if len(defaultRoutes) > 0 {
+		d.Findings = append(d.Findings, "Default route: "+strings.Join(firstN(defaultRoutes, 2), "; "))
+	}
+	if len(nameservers) == 0 {
+		d.Remediation = append(d.Remediation, "Add or restore valid nameserver entries before retrying resolution")
+	}
+	if len(defaultRoutes) == 0 {
+		d.Remediation = append(d.Remediation, "Restore a default route so DNS queries can leave the host")
+	}
+	if len(nameservers) > 0 && len(defaultRoutes) > 0 {
+		d.Remediation = append(d.Remediation, "Test name resolution directly against a configured resolver to confirm query success")
+	}
+	return d.Render(), true
+}
+
+func parseNetworkRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolCalls) < 2 || len(toolResults) < 2 {
+		return "", false
+	}
+	interfaceOutput := toolResults[0].Content
+	routeOutput := toolResults[1].Content
+
+	defaultRoutes := grepLines(routeOutput, `(?i)^(default|0\.0\.0\.0)`)
+	ifaceLines := firstNonEmptyLines(interfaceOutput, 6)
+	if len(defaultRoutes) == 0 && len(ifaceLines) == 0 {
+		return "", false
+	}
+
+	risk := "Medium"
+	summary := "Interfaces detected; verify route and interface state"
+	if len(defaultRoutes) == 0 {
+		risk = "High"
+		summary = "Interface data is present but no default route is visible"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	if len(ifaceLines) > 0 {
+		d.Findings = append(d.Findings, "Interface summary: "+strings.Join(ifaceLines, "; "))
+	}
+	if len(defaultRoutes) > 0 {
+		d.Findings = append(d.Findings, "Default route: "+strings.Join(firstN(defaultRoutes, 2), "; "))
+	}
+	if len(defaultRoutes) == 0 {
+		d.Remediation = append(d.Remediation, "Restore a default route or reconnect the interface that should carry outbound traffic")
+	} else {
+		d.Remediation = append(d.Remediation, "Validate the active interface and gateway with a direct connectivity check")
+	}
+	return d.Render(), true
+}
+
+func parseDiskUsageRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to single-command parser
+	if len(toolResults) == 1 {
+		return parseDiskUsage(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: df -h output, Tool 1: du output (top dirs)
+	dfResult, dfOK := parseDiskUsage(toolResults[0].Content)
+	if !dfOK {
+		return "", false
+	}
+
+	duLines := firstNonEmptyLines(toolResults[1].Content, 10)
+	if len(duLines) == 0 {
+		return dfResult, true
+	}
+
+	// Merge: append du findings into the df diagnostic
+	// Parse the df result back minimally — just append du as extra findings
+	var b strings.Builder
+	b.WriteString(dfResult)
+	b.WriteString("\n**Top space consumers**:\n")
+	for _, line := range duLines {
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+func parseMemoryPressureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to appropriate single-command parser
+	if len(toolResults) == 1 {
+		cmd := extractCommand(toolCalls[0].Input)
+		if strings.Contains(cmd, "vm_stat") {
+			return parseVmStat(toolResults[0].Content)
+		}
+		return parseMemory(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: free -h / vm_stat, Tool 1: ps aux --sort=-%mem
+	cmd0 := extractCommand(toolCalls[0].Input)
+	var memResult string
+	var memOK bool
+	if strings.Contains(cmd0, "vm_stat") {
+		memResult, memOK = parseVmStat(toolResults[0].Content)
+	} else {
+		memResult, memOK = parseMemory(toolResults[0].Content)
+	}
+	if !memOK {
+		return "", false
+	}
+
+	psLines := firstNonEmptyLines(toolResults[1].Content, 6)
+	if len(psLines) <= 1 {
+		return memResult, true
+	}
+
+	var b strings.Builder
+	b.WriteString(memResult)
+	b.WriteString("\n**Top memory consumers**:\n")
+	for _, line := range psLines[1:] { // skip ps header
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+func parsePerformanceCPURecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	// Single result: delegate to uptime parser
+	if len(toolResults) == 1 {
+		return parseUptime(toolResults[0].Content)
+	}
+	if len(toolResults) < 2 {
+		return "", false
+	}
+
+	// Tool 0: uptime, Tool 1: ps aux --sort=-%cpu
+	uptimeResult, uptimeOK := parseUptime(toolResults[0].Content)
+	if !uptimeOK {
+		return "", false
+	}
+
+	psLines := firstNonEmptyLines(toolResults[1].Content, 6)
+	if len(psLines) <= 1 {
+		return uptimeResult, true
+	}
+
+	var b strings.Builder
+	b.WriteString(uptimeResult)
+	b.WriteString("\n**Top CPU consumers**:\n")
+	for _, line := range psLines[1:] { // skip ps header
+		b.WriteString("- " + line + "\n")
+	}
+	return b.String(), true
+}
+
+// launchctlLine matches launchctl list columnar output: PID(or "-")  ExitCode(may be negative)  Label
+var launchctlLine = regexp.MustCompile(`^\s*(-|\d+)\s+(-?\d+)\s+(\S.+)$`)
+
+type launchctlEntry struct {
+	PID      string
+	ExitCode int
+	Label    string
+}
+
+// parseLaunchctlList parses launchctl list columnar output and returns entries
+// with non-zero exit codes (i.e. failed services).
+func parseLaunchctlList(output string) []launchctlEntry {
+	var entries []launchctlEntry
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// Skip header line
+		if strings.HasPrefix(trimmed, "PID") {
+			continue
+		}
+		m := launchctlLine.FindStringSubmatch(trimmed)
+		if m == nil {
+			continue
+		}
+		exitCode, _ := strconv.Atoi(m[2])
+		entries = append(entries, launchctlEntry{
+			PID:      m[1],
+			ExitCode: exitCode,
+			Label:    strings.TrimSpace(m[3]),
+		})
+	}
+	return entries
+}
+
+var sizePattern = regexp.MustCompile(`^\d+(\.\d+)?[BKMGTP]?i?$`)
+
+func looksLikeSize(s string) bool {
+	return sizePattern.MatchString(s) || s == "0"
+}
+
 // riskFromPercent returns a risk level string given a usage percentage.
 func riskFromPercent(pct int) string {
 	switch {
@@ -190,9 +684,13 @@ func parseDiskUsage(output string) (string, bool) {
 		if pctIdx < 3 {
 			continue
 		}
+		size := fields[pctIdx-3]
+		if !looksLikeSize(size) {
+			continue
+		}
 		entries = append(entries, entry{
 			Mount: fields[len(fields)-1],
-			Size:  fields[pctIdx-3],
+			Size:  size,
 			Used:  fields[pctIdx-2],
 			Avail: fields[pctIdx-1],
 			Pct:   fields[pctIdx],
@@ -390,10 +888,20 @@ var (
 	topCPULine  = regexp.MustCompile(`%Cpu.*?(\d+\.?\d*)\s*id`)
 	topMemLine  = regexp.MustCompile(`MiB Mem\s*:\s*([\d.]+)\s+total.*?([\d.]+)\s+free.*?([\d.]+)\s+used`)
 	topTaskLine = regexp.MustCompile(`Tasks:\s*(\d+)\s+total.*?(\d+)\s+running`)
+
+	// macOS top -l1 header regexes
+	macTopProcesses = regexp.MustCompile(`Processes:\s*(\d+)\s+total.*?(\d+)\s+running`)
+	macTopCPU       = regexp.MustCompile(`CPU usage:\s*([\d.]+)%\s*user.*?([\d.]+)%\s*sys.*?([\d.]+)%\s*idle`)
+	macTopMem       = regexp.MustCompile(`PhysMem:\s*(\S+)\s+used.*?(\S+)\s+unused`)
+	macTopLoad      = regexp.MustCompile(`Load Avg:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)`)
 )
 
-// parseTop handles top -bn1 output (Linux).
+// parseTop handles top output (Linux top -bn1 or macOS top -l1).
 func parseTop(output string) (string, bool) {
+	if strings.Contains(output, "CPU usage:") {
+		return parseMacTop(output)
+	}
+
 	lines := strings.Split(output, "\n")
 	if len(lines) < 5 {
 		return "", false
@@ -468,6 +976,93 @@ func parseTop(output string) (string, bool) {
 	return d.Render(), true
 }
 
+// parseMacTop handles macOS top -l1 output.
+func parseMacTop(output string) (string, bool) {
+	lines := strings.Split(output, "\n")
+	if len(lines) < 4 {
+		return "", false
+	}
+
+	var cpuUser, cpuSys, cpuIdle float64
+	var memUsed, memUnused string
+	var tasksTotal, tasksRunning string
+	var load1, load5, load15 string
+
+	for _, line := range lines {
+		if m := macTopCPU.FindStringSubmatch(line); len(m) == 4 {
+			cpuUser, _ = strconv.ParseFloat(m[1], 64)
+			cpuSys, _ = strconv.ParseFloat(m[2], 64)
+			cpuIdle, _ = strconv.ParseFloat(m[3], 64)
+		}
+		if m := macTopMem.FindStringSubmatch(line); len(m) == 3 {
+			memUsed, memUnused = m[1], m[2]
+		}
+		if m := macTopProcesses.FindStringSubmatch(line); len(m) == 3 {
+			tasksTotal, tasksRunning = m[1], m[2]
+		}
+		if m := macTopLoad.FindStringSubmatch(line); len(m) == 4 {
+			load1, load5, load15 = m[1], m[2], m[3]
+		}
+	}
+
+	cpuUsed := cpuUser + cpuSys
+	if cpuIdle == 0 && cpuUsed == 0 {
+		return "", false
+	}
+
+	risk := "Low"
+	switch {
+	case cpuUsed >= 95:
+		risk = "Critical"
+	case cpuUsed >= 90:
+		risk = "High"
+	case cpuUsed >= 70:
+		risk = "Medium"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("CPU usage at %.1f%%", cpuUsed),
+		RiskLevel: risk,
+	}
+	if tasksTotal != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Tasks: %s total, %s running", tasksTotal, tasksRunning))
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("CPU: %.1f%% user, %.1f%% sys, %.1f%% idle", cpuUser, cpuSys, cpuIdle))
+	if load1 != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Load Avg: %s (1m), %s (5m), %s (15m)", load1, load5, load15))
+	}
+	if memUsed != "" {
+		d.Findings = append(d.Findings, fmt.Sprintf("Memory: %s used, %s unused", memUsed, memUnused))
+	}
+
+	// Collect top processes (lines after the header that have PID data)
+	inProcs := false
+	var topProcs []string
+	for _, line := range lines {
+		if strings.Contains(line, "PID") && (strings.Contains(line, "COMMAND") || strings.Contains(line, "CMD")) {
+			inProcs = true
+			continue
+		}
+		if inProcs && len(strings.TrimSpace(line)) > 0 {
+			topProcs = append(topProcs, strings.TrimSpace(line))
+			if len(topProcs) >= 5 {
+				break
+			}
+		}
+	}
+	for _, proc := range topProcs {
+		fields := strings.Fields(proc)
+		if len(fields) >= 3 {
+			d.Findings = append(d.Findings, fmt.Sprintf("Process: %s", strings.Join(fields, " ")))
+		}
+	}
+
+	if risk != "Low" {
+		d.Remediation = append(d.Remediation, "Identify CPU-heavy processes and consider throttling or restarting them")
+	}
+	return d.Render(), true
+}
+
 // parseProcesses handles ps aux output.
 func parseProcesses(output string) (string, bool) {
 	lines := strings.Split(output, "\n")
@@ -506,6 +1101,13 @@ func parseProcesses(output string) (string, bool) {
 		return "", false
 	}
 
+	// Sort by CPU descending so top consumers appear first
+	sort.Slice(procs, func(i, j int) bool {
+		ci, _ := strconv.ParseFloat(procs[i].CPU, 64)
+		cj, _ := strconv.ParseFloat(procs[j].CPU, 64)
+		return ci > cj
+	})
+
 	risk := "Low"
 	switch {
 	case maxCPU >= 80 || maxMem >= 80:
@@ -520,23 +1122,19 @@ func parseProcesses(output string) (string, bool) {
 	}
 	d.Findings = append(d.Findings, fmt.Sprintf("Total processes: %d", len(procs)))
 
-	// Show top 5 by CPU
-	shown := 0
-	for _, p := range procs {
-		cpu, _ := strconv.ParseFloat(p.CPU, 64)
-		if cpu > 0.5 || shown < 5 {
-			cmdShort := p.Command
-			if len(cmdShort) > 60 {
-				cmdShort = cmdShort[:60] + "..."
-			}
-			d.Findings = append(d.Findings,
-				fmt.Sprintf("PID %s (%s): CPU %s%%, MEM %s%% — %s",
-					p.PID, p.User, p.CPU, p.MEM, cmdShort))
-			shown++
-			if shown >= 10 {
-				break
-			}
+	// Show top 10 from sorted list
+	limit := 10
+	if limit > len(procs) {
+		limit = len(procs)
+	}
+	for _, p := range procs[:limit] {
+		cmdShort := p.Command
+		if len(cmdShort) > 60 {
+			cmdShort = cmdShort[:60] + "..."
 		}
+		d.Findings = append(d.Findings,
+			fmt.Sprintf("PID %s (%s): CPU %s%%, MEM %s%% — %s",
+				p.PID, p.User, p.CPU, p.MEM, cmdShort))
 	}
 	if risk != "Low" {
 		d.Remediation = append(d.Remediation, "Investigate high-usage processes for possible issues")
@@ -836,7 +1434,7 @@ func parseUname(output string) (string, bool) {
 		return "", false
 	}
 
-	os := fields[0]     // "Linux" or "Darwin"
+	os := fields[0] // "Linux" or "Darwin"
 	hostname := fields[1]
 	kernel := fields[2]
 	arch := ""
@@ -897,6 +1495,7 @@ func parseSwVers(output string) (string, bool) {
 }
 
 var vmStatLine = regexp.MustCompile(`^(.+?):\s+([\d]+)\.?$`)
+var vmStatPageSize = regexp.MustCompile(`page size of (\d+) bytes`)
 
 // parseVmStat handles macOS vm_stat output.
 func parseVmStat(output string) (string, bool) {
@@ -907,7 +1506,7 @@ func parseVmStat(output string) (string, bool) {
 
 	// Extract page size from first line
 	pageSize := 4096 // default
-	if m := regexp.MustCompile(`page size of (\d+) bytes`).FindStringSubmatch(lines[0]); len(m) == 2 {
+	if m := vmStatPageSize.FindStringSubmatch(lines[0]); len(m) == 2 {
 		pageSize, _ = strconv.Atoi(m[1])
 	}
 
@@ -1039,5 +1638,227 @@ func parseEtcFile(command, output string) (string, bool) {
 			break
 		}
 	}
+	return d.Render(), true
+}
+
+// parseDockerCrashRecipe handles docker inspect + docker logs output.
+func parseDockerCrashRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	containerName := recipe.ServiceName
+	if containerName == "" {
+		containerName = "container"
+	}
+
+	firstOutput := strings.TrimSpace(toolResults[0].Content)
+	if firstOutput == "" {
+		return "", false
+	}
+
+	// Case A: docker ps -a listing (no specific container)
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.Contains(cmd, "docker ps") {
+		return parseDockerListing(firstOutput)
+	}
+
+	// Case B: docker inspect output
+	oom := strings.Contains(firstOutput, "oom:true") || strings.Contains(firstOutput, "OOMKilled:true")
+	exitCodeRe := regexp.MustCompile(`exit:(\d+)`)
+	exitCodeStr := "0"
+	exitCode := 0
+	if m := exitCodeRe.FindStringSubmatch(firstOutput); len(m) == 2 {
+		exitCodeStr = m[1]
+		exitCode, _ = strconv.Atoi(m[1])
+	}
+	status := ""
+	if fields := strings.Fields(firstOutput); len(fields) > 0 {
+		status = fields[0]
+	}
+
+	// Collect log errors if we have a second result
+	var logErrors []string
+	if len(toolResults) >= 2 {
+		logOutput := strings.TrimSpace(toolResults[1].Content)
+		logErrors = grepLines(logOutput, `(?i)(error|fatal|panic|killed|oom|denied|permission|refused|not found|exception)`)
+	}
+
+	// Container is running
+	if status == "running" && exitCode == 0 && !oom {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s is running normally", containerName),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, fmt.Sprintf("Status: %s, exit code: %s", status, exitCodeStr))
+		if len(logErrors) > 0 {
+			for _, line := range firstN(logErrors, 4) {
+				d.Findings = append(d.Findings, line)
+			}
+			d.Remediation = append(d.Remediation, "Container is running but logs contain errors — monitor for recurrence")
+		}
+		return d.Render(), true
+	}
+
+	// Determine root cause
+	rootCause := "container crash"
+	risk := "High"
+	if oom {
+		rootCause = "OOM killed — container exceeded memory limit"
+		risk = "Critical"
+	} else if exitCode == 137 {
+		rootCause = "killed by SIGKILL (exit 137) — likely OOM or manual kill"
+		risk = "Critical"
+	} else if exitCode == 1 {
+		rootCause = "application error (exit 1)"
+		if len(logErrors) > 0 {
+			for _, line := range logErrors {
+				lower := strings.ToLower(line)
+				if strings.Contains(lower, "not found") {
+					rootCause = "missing dependency or file (exit 1)"
+					break
+				}
+				if strings.Contains(lower, "permission") || strings.Contains(lower, "denied") {
+					rootCause = "permission error (exit 1)"
+					risk = "Critical"
+					break
+				}
+			}
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s crashed: %s", containerName, rootCause),
+		RiskLevel: risk,
+	}
+	d.Findings = append(d.Findings, fmt.Sprintf("Status: %s, exit code: %s, OOMKilled: %v", status, exitCodeStr, oom))
+	for _, line := range firstN(logErrors, 6) {
+		d.Findings = append(d.Findings, line)
+	}
+
+	if oom || exitCode == 137 {
+		d.Remediation = append(d.Remediation, "Increase container memory limit or optimize application memory usage")
+	} else {
+		d.Remediation = append(d.Remediation, "Review container logs and fix the application error before restarting")
+	}
+	d.Remediation = append(d.Remediation, fmt.Sprintf("Restart with: `docker restart %s`", containerName))
+	return d.Render(), true
+}
+
+// parseDockerListing handles docker ps -a listing output when no specific container is targeted.
+func parseDockerListing(output string) (string, bool) {
+	lines := firstNonEmptyLines(output, 30)
+	if len(lines) <= 1 {
+		return "", false
+	}
+
+	exited := grepLines(output, `(?i)exited`)
+	restarting := grepLines(output, `(?i)restarting`)
+
+	risk := "Low"
+	summary := fmt.Sprintf("%d containers listed", len(lines)-1)
+	if len(exited) > 0 || len(restarting) > 0 {
+		risk = "Medium"
+		summary = fmt.Sprintf("%d containers listed, %d exited, %d restarting",
+			len(lines)-1, len(exited), len(restarting))
+	}
+	if len(restarting) > 0 {
+		risk = "High"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(lines, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(exited)+len(restarting) > 0 {
+		d.Remediation = append(d.Remediation, "Inspect crashed containers: `docker inspect <name>` and `docker logs <name>`")
+	}
+	return d.Render(), true
+}
+
+// parseBuildFailureRecipe handles build tool output (npm, go, cargo, etc.).
+func parseBuildFailureRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 {
+		return "", false
+	}
+
+	output := strings.TrimSpace(toolResults[0].Content)
+	if output == "" {
+		return "", false
+	}
+
+	buildTool := recipe.ServiceName
+	if buildTool == "" {
+		buildTool = "build"
+	}
+
+	// Check if this was the auto-detect command (ls for manifest files)
+	cmd := extractCommand(toolCalls[0].Input)
+	if strings.HasPrefix(cmd, "ls ") {
+		return parseBuildAutoDetect(output)
+	}
+
+	// Look for error lines
+	errorLines := grepLines(output, `(?i)(error|ERR!|ERESOLVE|cannot find|undefined:|imported and not used|syntax error|mismatched types|error\[E|fatal:|undefined reference|failed)`)
+
+	if len(errorLines) == 0 {
+		d := DiagnosticResult{
+			Summary:   fmt.Sprintf("%s build completed successfully", buildTool),
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, "No error patterns found in build output")
+		snippet := firstNonEmptyLines(output, 4)
+		for _, line := range snippet {
+			d.Findings = append(d.Findings, line)
+		}
+		return d.Render(), true
+	}
+
+	risk := "Medium"
+	if len(errorLines) >= 5 {
+		risk = "High"
+	}
+	if len(errorLines) >= 10 {
+		risk = "Critical"
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("%s build failed with %d error(s)", buildTool, len(errorLines)),
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(errorLines, 8) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(errorLines) > 8 {
+		d.Findings = append(d.Findings, fmt.Sprintf("... and %d more errors", len(errorLines)-8))
+	}
+	d.Remediation = append(d.Remediation, "Fix the errors listed above and re-run the build")
+	return d.Render(), true
+}
+
+// parseBuildAutoDetect handles `ls package.json Cargo.toml ...` output for build tool detection.
+func parseBuildAutoDetect(output string) (string, bool) {
+	files := firstNonEmptyLines(output, 10)
+	if len(files) == 0 {
+		d := DiagnosticResult{
+			Summary:   "No build manifest files found in current directory",
+			RiskLevel: "Low",
+		}
+		d.Findings = append(d.Findings, "No package.json, Cargo.toml, go.mod, or Makefile detected")
+		d.Remediation = append(d.Remediation, "Ensure you are in the correct project directory")
+		return d.Render(), true
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("Detected %d build manifest(s)", len(files)),
+		RiskLevel: "Low",
+	}
+	for _, f := range files {
+		d.Findings = append(d.Findings, f)
+	}
+	d.Remediation = append(d.Remediation, "Run the build command for the detected project type")
 	return d.Render(), true
 }
