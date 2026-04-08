@@ -12,11 +12,11 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/bedrock"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	toolsPkg "github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/config"
+	"github.com/AIdoesmyjob/termfix/internal/llm/models"
+	toolsPkg "github.com/AIdoesmyjob/termfix/internal/llm/tools"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 )
 
 type anthropicOptions struct {
@@ -128,7 +128,7 @@ func (a *anthropicClient) convertTools(tools []toolsPkg.BaseTool) []anthropic.To
 			Description: anthropic.String(info.Description),
 			InputSchema: anthropic.ToolInputSchemaParam{
 				Properties: info.Parameters,
-				// TODO: figure out how we can tell claude the required fields?
+				Required:   info.Required,
 			},
 		}
 

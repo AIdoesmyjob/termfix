@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/permission"
-	"github.com/opencode-ai/opencode/internal/version"
+	"github.com/AIdoesmyjob/termfix/internal/config"
+	"github.com/AIdoesmyjob/termfix/internal/llm/tools"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/permission"
+	"github.com/AIdoesmyjob/termfix/internal/version"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"

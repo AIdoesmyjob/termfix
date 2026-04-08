@@ -13,11 +13,11 @@ import (
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/shared"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	toolsPkg "github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/config"
+	"github.com/AIdoesmyjob/termfix/internal/llm/models"
+	toolsPkg "github.com/AIdoesmyjob/termfix/internal/llm/tools"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 )
 
 type copilotOptions struct {
@@ -514,8 +514,8 @@ func (c *copilotClient) stream(ctx context.Context, messages []message.Message, 
 				close(eventChan)
 				return
 			}
-			// shouldRetry is not catching the max retries...
-			// TODO: Figure out why
+			// shouldRetry handles HTTP status-based retry logic (429, 500, 401)
+			// but does not enforce the attempt count limit itself, so we guard it here.
 			if attempts > maxRetries {
 				logging.Warn("Maximum retry attempts reached for rate limit", "attempts", attempts, "max_retries", maxRetries)
 				retry = false

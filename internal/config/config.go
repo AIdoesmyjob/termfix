@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	"github.com/opencode-ai/opencode/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/llm/models"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
 	"github.com/spf13/viper"
 )
 
@@ -472,9 +472,7 @@ func applyDefaultValues() {
 // It validates model IDs and providers, ensuring they are supported.
 func validateAgent(cfg *Config, name AgentName, agent Agent) error {
 	// Check if model exists
-	// TODO:	If a copilot model is specified, but model is not found,
-	// 		 	it might be new model. The https://api.githubcopilot.com/models
-	// 		 	endpoint should be queried to validate if the model is supported.
+	// Future: query api.githubcopilot.com/models for dynamic model discovery.
 	model, modelExists := models.SupportedModels[agent.Model]
 	if !modelExists {
 		logging.Warn("unsupported model configured, reverting to default",

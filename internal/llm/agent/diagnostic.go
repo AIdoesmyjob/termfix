@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/opencode-ai/opencode/internal/diagnose"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/diagnose"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 )
 
 // DiagnosticResult holds a structured diagnostic built from real parsed values.

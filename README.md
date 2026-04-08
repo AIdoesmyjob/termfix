@@ -53,7 +53,7 @@ Each release archive (~600 MB) is fully self-contained:
 | `termfix.sh` / `termfix.bat` | Startup orchestrator |
 | `models/` | Fine-tuned diagnostic model (see below) |
 
-### Bundled Model: termfix-cycle8 (Qwen 3.5 0.8B fine-tune)
+### Bundled Model: termfix-cycle12 (Qwen 3.5 0.8B fine-tune)
 
 | Property | Value |
 |----------|-------|
@@ -66,9 +66,11 @@ Each release archive (~600 MB) is fully self-contained:
 
 The model is trained specifically for system troubleshooting: selecting the right diagnostic command, executing it, and analyzing the real output. It handles tool calling natively using Qwen's XML format.
 
-## Architecture: Two-Pass Design for Small Models
+## Architecture
 
-Termfix uses a **two-pass architecture** designed specifically for reliable tool calling with sub-1B parameter models:
+### Two-Pass Design for Small Models
+
+Termfix uses a **two-pass architecture** designed for reliable tool calling with sub-1B parameter models:
 
 ```
 Pass 1: Tool Selection (with tool definitions)
@@ -80,14 +82,45 @@ Pass 2: Diagnostic Generation (no tools, fresh context)
   Non-streaming request, text-only generation
 ```
 
-**Why two passes?** Small models (0.6-1.5B) struggle with multi-turn tool calling — the growing conversation history of tool calls and results fills the context window and causes generation loops. By splitting into two independent, fresh-context passes, each pass is short and focused (exactly what small models are good at).
+**Why two passes?** Small models (0.6-1.5B) struggle with multi-turn tool calling — the growing conversation history fills the context window and causes generation loops. By splitting into two independent, fresh-context passes, each pass is short and focused.
 
-Key design decisions:
-- **Non-streaming** for both passes — llama-server's PEG grammar parser only reliably detects tool calls in non-streaming mode
-- **No tool definitions in Pass 2** — saves ~4000 tokens, prevents the model from trying to make another tool call
-- **Input sanitization** — extracts the first clean command line from hallucinated multi-line parameters
-- **Compact tool descriptions** — 1-line descriptions instead of the full 150-line originals (saves ~3500 tokens)
-- **Repetition truncation** — detects and stops generation loops in small model output
+### Deterministic Recipe System
+
+For common diagnostic scenarios, termfix bypasses the model entirely with **deterministic recipes**:
+
+| Recipe | Trigger Examples | Commands |
+|--------|-----------------|----------|
+| `disk_usage` | "disk full", "no space left" | `df -h`, `du -sh /*` |
+| `memory_pressure` | "out of memory", "OOM" | `free -h` / `vm_stat` |
+| `performance_cpu` | "high CPU", "slow system" | `top -bn1` / `top -l1` |
+| `dns_resolution` | "DNS not resolving", "can't resolve" | `cat /etc/resolv.conf`, `nslookup` |
+| `network_connectivity` | "no internet", "can't reach" | `ping`, `ip route` / `netstat -rn` |
+| `service_failure` | "service crashed", "won't start" | `systemctl` / `launchctl` |
+| `docker_crash` | "container crashing" | `docker ps -a`, `docker logs` |
+| `build_failure` | "build failing", "make error" | Context-dependent |
+
+Recipes use Go parsers to analyze command output directly — no model inference, zero hallucination risk. The model is only used for novel/complex queries.
+
+### Structured Diagnostics
+
+All diagnostic output follows a consistent structure:
+
+```
+Summary: <one-line description>
+Root Cause: <what's wrong>
+Risk Level: <low/medium/high/critical>
+Evidence: <specific data from command output>
+Remediation: <exact commands to fix>
+Rollback: <how to undo if needed>
+```
+
+### Safety Features
+
+- **Fabrication filtering** — strips lines containing numeric values not found in actual command output
+- **Input sanitization** — extracts first clean command line from hallucinated multi-line parameters
+- **Repetition truncation** — detects and stops generation loops
+- **Knowledge query detection** — routes "what is X" questions to direct answers without tool calling
+- **Platform-aware routing** — selects correct commands for Linux vs macOS
 
 ## Usage
 
@@ -149,12 +182,12 @@ The diagnostic assistant has access to read-only inspection tools:
 
 ## How It Works
 
-1. `termfix.sh` finds the model in `models/` (prefers Qwen 3.5 models)
+1. `termfix.sh` finds the model in `models/` (prefers latest Qwen 3.5 models)
 2. Starts `llama-server` on `localhost:8012` with optimized sampling params
 3. Waits for the server health check to pass
 4. Auto-generates `.termfix.json` config mapping agents to the loaded model
 5. Launches the TUI, which connects to the server via OpenAI-compatible API
-6. User query → Pass 1 (tool selection) → tool execution → Pass 2 (diagnostic) → response
+6. User query → recipe check → Pass 1 (tool selection) → tool execution → Pass 2 (diagnostic) → response
 7. On exit, the cleanup trap kills the server
 
 Data is stored in:
@@ -169,16 +202,16 @@ Key training details:
 - 2000+ examples covering bash commands, file viewing, pattern search, and knowledge questions
 - Native Qwen XML tool calling format (`<function=name><parameter=key>value</parameter></function>`)
 - Trained with the exact system prompt and tool definitions used in production
-- 8 training cycles with automated quality gates (tool selection accuracy, grounding, hallucination detection)
+- 12 training cycles with automated quality gates (tool selection accuracy, grounding, hallucination detection)
 
-To fine-tune your own model, see `training/generate_data.py` for the data format and `training/train_config.yaml` for Unsloth configuration.
+See `training/AUTONOMOUS_TRAINING.md` for the full training specification and evaluation criteria.
 
 ## Building from Source
 
 ```bash
 git clone https://github.com/AIdoesmyjob/termfix.git
 cd termfix
-go build -ldflags "-X 'github.com/opencode-ai/opencode/internal/version.Version=dev'" -o termfix
+go build -ldflags "-X 'github.com/AIdoesmyjob/termfix/internal/version.Version=dev'" -o termfix
 ```
 
 Requires Go 1.24+. You'll need to provide your own `llama-server` binary, shared libraries, and GGUF model files separately.

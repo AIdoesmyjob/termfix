@@ -54,8 +54,8 @@ opencode.md
 # Training intermediate outputs (large model weights, adapters)
 training/output/
 
-# Old model cycles (only cycle8 production model tracked via LFS)
-models/termfix-cycle[1-7]*
+# Model files (large, not tracked in git)
+models/*.gguf
 
 # Misc
 disk_usage.txt

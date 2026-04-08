@@ -42,7 +42,7 @@ jobs:
         run: |
           TAG=${GITHUB_REF#refs/tags/}
           go build \
-            -ldflags "-X 'github.com/opencode-ai/opencode/internal/version.Version=${TAG}'" \
+            -ldflags "-X 'github.com/AIdoesmyjob/termfix/internal/version.Version=${TAG}'" \
             -o termfix-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
 
       - name: Upload artifact

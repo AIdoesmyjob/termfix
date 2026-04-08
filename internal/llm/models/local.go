@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/opencode-ai/opencode/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
 	"github.com/spf13/viper"
 )
 

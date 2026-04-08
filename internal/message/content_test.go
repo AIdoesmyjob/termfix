@@ -4,7 +4,7 @@ import (
 	"encoding/base64"
 	"testing"
 
-	"github.com/opencode-ai/opencode/internal/llm/models"
+	"github.com/AIdoesmyjob/termfix/internal/llm/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

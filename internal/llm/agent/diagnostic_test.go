@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/opencode-ai/opencode/internal/diagnose"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/diagnose"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

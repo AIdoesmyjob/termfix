@@ -3,8 +3,8 @@ package provider
 import (
 	"testing"
 
-	"github.com/opencode-ai/opencode/internal/llm/models"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/llm/models"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -6,12 +6,12 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/message"
-	"github.com/opencode-ai/opencode/internal/session"
-	"github.com/opencode-ai/opencode/internal/tui/styles"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
-	"github.com/opencode-ai/opencode/internal/version"
+	"github.com/AIdoesmyjob/termfix/internal/config"
+	"github.com/AIdoesmyjob/termfix/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/session"
+	"github.com/AIdoesmyjob/termfix/internal/tui/styles"
+	"github.com/AIdoesmyjob/termfix/internal/tui/theme"
+	"github.com/AIdoesmyjob/termfix/internal/version"
 )
 
 type SendMsg struct {

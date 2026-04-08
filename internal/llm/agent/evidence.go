@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/opencode-ai/opencode/internal/diagnose"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/diagnose"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 )
 
 func buildPass2Content(userContent string, recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) string {

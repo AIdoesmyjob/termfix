@@ -11,10 +11,10 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/fsnotify/fsnotify"
-	"github.com/opencode-ai/opencode/internal/config"
-	"github.com/opencode-ai/opencode/internal/logging"
-	"github.com/opencode-ai/opencode/internal/lsp"
-	"github.com/opencode-ai/opencode/internal/lsp/protocol"
+	"github.com/AIdoesmyjob/termfix/internal/config"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
+	"github.com/AIdoesmyjob/termfix/internal/lsp"
+	"github.com/AIdoesmyjob/termfix/internal/lsp/protocol"
 )
 
 // WorkspaceWatcher manages LSP file watching
@@ -732,8 +732,7 @@ func shouldPreloadFiles(serverName string) bool {
 	}
 }
 
-// Common patterns for directories and files to exclude
-// TODO: make configurable
+// Hardcoded exclusion list; sufficient for termfix's diagnostic use case.
 var (
 	excludedDirNames = map[string]bool{
 		".git":         true,

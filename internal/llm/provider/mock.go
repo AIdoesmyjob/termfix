@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 
-	"github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/llm/tools"
+	"github.com/AIdoesmyjob/termfix/internal/message"
 )
 
 // MockClient implements ProviderClient for testing purposes.

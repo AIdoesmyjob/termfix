@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/opencode-ai/opencode/cmd"
-	"github.com/opencode-ai/opencode/internal/logging"
+	"github.com/AIdoesmyjob/termfix/cmd"
+	"github.com/AIdoesmyjob/termfix/internal/logging"
 )
 
 func main() {

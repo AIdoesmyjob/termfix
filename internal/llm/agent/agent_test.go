@@ -9,10 +9,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/opencode-ai/opencode/internal/diagnose"
-	"github.com/opencode-ai/opencode/internal/llm/tools"
-	"github.com/opencode-ai/opencode/internal/message"
-	"github.com/opencode-ai/opencode/internal/pubsub"
+	"github.com/AIdoesmyjob/termfix/internal/diagnose"
+	"github.com/AIdoesmyjob/termfix/internal/llm/tools"
+	"github.com/AIdoesmyjob/termfix/internal/message"
+	"github.com/AIdoesmyjob/termfix/internal/pubsub"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

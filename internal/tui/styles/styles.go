@@ -2,7 +2,7 @@ package styles
 
 import (
 	"github.com/charmbracelet/lipgloss"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
+	"github.com/AIdoesmyjob/termfix/internal/tui/theme"
 )
 
 var (

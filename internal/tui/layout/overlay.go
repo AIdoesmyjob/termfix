@@ -8,9 +8,9 @@ import (
 	"github.com/muesli/ansi"
 	"github.com/muesli/reflow/truncate"
 	"github.com/muesli/termenv"
-	"github.com/opencode-ai/opencode/internal/tui/styles"
-	"github.com/opencode-ai/opencode/internal/tui/theme"
-	"github.com/opencode-ai/opencode/internal/tui/util"
+	"github.com/AIdoesmyjob/termfix/internal/tui/styles"
+	"github.com/AIdoesmyjob/termfix/internal/tui/theme"
+	"github.com/AIdoesmyjob/termfix/internal/tui/util"
 )
 
 // Most of this code is borrowed from
@@ -67,10 +67,9 @@ func PlaceOverlay(
 	}
 
 	if fgWidth >= bgWidth && fgHeight >= bgHeight {
-		// FIXME: return fg or bg?
+		// fg fully covers bg, so just return fg directly.
 		return fg
 	}
-	// TODO: allow placement outside of the bg box?
 	x = util.Clamp(x, 0, bgWidth-fgWidth)
 	y = util.Clamp(y, 0, bgHeight-fgHeight)
 
