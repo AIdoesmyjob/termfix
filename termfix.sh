@@ -31,15 +31,9 @@ if [ -n "$MODEL" ] && [ ! -f "$MODEL" ]; then
   echo "ERROR: TERMFIX_MODEL file not found: $MODEL"
   exit 1
 fi
-# Model discovery priority: Qwen 3.5 (newest/best) → Qwen 1.5B (legacy) → any GGUF
+# Model discovery: pick the most recently modified .gguf file
 if [ -z "$MODEL" ]; then
-  MODEL=$(ls "$MODEL_DIR"/*qwen3.5* "$MODEL_DIR"/*qwen3_5* 2>/dev/null | head -1 || true)
-fi
-if [ -z "$MODEL" ]; then
-  MODEL=$(ls "$MODEL_DIR"/*qwen15b*q4_k_m* 2>/dev/null | head -1 || true)
-fi
-if [ -z "$MODEL" ]; then
-  MODEL=$(ls "$MODEL_DIR"/*.gguf 2>/dev/null | head -1 || true)
+  MODEL=$(ls -t "$MODEL_DIR"/*.gguf 2>/dev/null | head -1 || true)
 fi
 if [ -z "$MODEL" ]; then
   echo "ERROR: No model found in $MODEL_DIR"

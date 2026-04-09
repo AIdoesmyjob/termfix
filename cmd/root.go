@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +64,7 @@ and investigating problems directly from the terminal.`,
 		prompt, _ := cmd.Flags().GetString("prompt")
 		outputFormat, _ := cmd.Flags().GetString("output-format")
 		quiet, _ := cmd.Flags().GetBool("quiet")
+		fixMode, _ := cmd.Flags().GetBool("fix")
 
 		// Validate format option
 		if !format.IsValid(outputFormat) {
@@ -82,10 +84,11 @@ and investigating problems directly from the terminal.`,
 			}
 			cwd = c
 		}
-		_, err := config.Load(cwd, debug)
+		cfg, err := config.Load(cwd, debug)
 		if err != nil {
 			return err
 		}
+		cfg.FixMode = fixMode
 
 		// Connect DB, this will also run migrations
 		conn, err := db.Connect()
@@ -109,7 +112,9 @@ and investigating problems directly from the terminal.`,
 
 		// Non-interactive mode
 		if prompt != "" {
-			// Run non-interactive flow using the App method
+			if strings.TrimSpace(prompt) == "" {
+				return fmt.Errorf("prompt cannot be empty")
+			}
 			return app.RunNonInteractive(ctx, prompt, outputFormat, quiet)
 		}
 
@@ -300,6 +305,9 @@ func init() {
 
 	// Add quiet flag to hide spinner in non-interactive mode
 	rootCmd.Flags().BoolP("quiet", "q", false, "Hide spinner in non-interactive mode")
+
+	// Add fix flag for remediation mode
+	rootCmd.Flags().BoolP("fix", "x", false, "Enable fix mode: propose and execute remediation after diagnosis")
 
 	// Register custom validation for the format flag
 	rootCmd.RegisterFlagCompletionFunc("output-format", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {

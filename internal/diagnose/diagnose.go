@@ -14,6 +14,13 @@ const (
 	IssueNetwork     IssueClass = "network"
 	IssueDocker      IssueClass = "docker"
 	IssueBuild       IssueClass = "build"
+	IssuePermission  IssueClass = "permission"
+	IssuePort        IssueClass = "port"
+	IssueSSL         IssueClass = "ssl"
+	IssueGit         IssueClass = "git"
+	IssueCron        IssueClass = "cron"
+	IssuePackage     IssueClass = "package"
+	IssueProcess     IssueClass = "process"
 )
 
 func BuildDiagnosePrompt(userError string) string {

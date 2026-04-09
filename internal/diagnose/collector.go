@@ -56,6 +56,21 @@ func ClassifyIssue(userError string) IssueClass {
 	switch {
 	case normalized == "", strings.Contains(normalized, "general system health check"), strings.Contains(normalized, "system health"):
 		return IssueGeneral
+	case containsAny(normalized, "permission denied", "access denied", "chmod", "403"):
+		return IssuePermission
+	case containsAny(normalized, "address already in use", "eaddrinuse", "bind failed") ||
+		(containsAny(normalized, "port") && containsAny(normalized, "in use", "conflict", "busy", "listen", "occupied")):
+		return IssuePort
+	case containsAny(normalized, "ssl", "tls", "certificate", "cert", "x509", "expired cert"):
+		return IssueSSL
+	case containsAny(normalized, "merge conflict", "detached head", "git pull", "git push", "git rebase"):
+		return IssueGit
+	case containsAny(normalized, "cron", "crontab", "scheduled", "timer"):
+		return IssueCron
+	case containsAny(normalized, "zombie", "defunct", "too many open files", "ulimit"):
+		return IssueProcess
+	case containsAny(normalized, "apt", "dpkg", "brew", "pip", "locked", "broken package"):
+		return IssuePackage
 	case containsAny(normalized, "disk", "storage", "space", "filesystem", "partition", "full"):
 		return IssueDisk
 	case containsAny(normalized, "memory", "ram", "swap", "oom", "out of memory"):
@@ -123,6 +138,34 @@ func planFactsForIssue(issueClass IssueClass) []factCollector {
 			{Title: "Containers", Run: func() string {
 				return runCmd("docker", "ps", "-a", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}")
 			}},
+		}
+	case IssuePermission:
+		return []factCollector{
+			{Title: "User Info", Run: func() string { return runCmd("id") }},
+		}
+	case IssuePort:
+		return []factCollector{
+			{Title: "Listening Ports", Run: collectListeningPorts},
+		}
+	case IssueSSL:
+		return []factCollector{
+			{Title: "Current Time (UTC)", Run: func() string { return runCmd("date", "-u") }},
+		}
+	case IssueGit:
+		return []factCollector{
+			{Title: "Git Status", Run: func() string { return runCmd("git", "status") }},
+		}
+	case IssueCron:
+		return []factCollector{
+			{Title: "Crontab", Run: func() string { return runCmd("sh", "-c", "crontab -l 2>&1") }},
+		}
+	case IssuePackage:
+		return []factCollector{
+			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
+		}
+	case IssueProcess:
+		return []factCollector{
+			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
 		}
 	case IssueBuild:
 		return []factCollector{
@@ -276,6 +319,16 @@ func collectDNSFacts() string {
 	return ""
 }
 
+func collectListeningPorts() string {
+	if runtime.GOOS == "linux" {
+		return runCmd("ss", "-tlnp")
+	}
+	if runtime.GOOS == "darwin" {
+		return runCmd("lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n")
+	}
+	return ""
+}
+
 func collectFailedServices() string {
 	if runtime.GOOS == "linux" {
 		return runCmd("systemctl", "--failed", "--no-pager", "--plain")
@@ -335,6 +388,26 @@ var buildToolRe = regexp.MustCompile(`\b(npm|yarn|pnpm|cargo|go|make|cmake|gradl
 
 func ExtractBuildTool(value string) string {
 	match := buildToolRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+var portRe = regexp.MustCompile(`\b(?:port\s+)?(\d{2,5})\b`)
+
+func ExtractPort(value string) string {
+	match := portRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+var pathRe = regexp.MustCompile(`(?:^|\s)(/?(?:[a-zA-Z0-9._-]+/)+[a-zA-Z0-9._-]+)`)
+
+func ExtractPath(value string) string {
+	match := pathRe.FindStringSubmatch(value)
 	if len(match) >= 2 {
 		return match[1]
 	}

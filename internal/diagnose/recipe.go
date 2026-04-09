@@ -19,6 +19,13 @@ const (
 	RecipeServiceFailure      RecipeName = "service_failure"
 	RecipeDockerCrash         RecipeName = "docker_crash"
 	RecipeBuildFailure        RecipeName = "build_failure"
+	RecipePermission          RecipeName = "permission"
+	RecipePortConflict        RecipeName = "port_conflict"
+	RecipeSSL                 RecipeName = "ssl"
+	RecipeGit                 RecipeName = "git"
+	RecipeCron                RecipeName = "cron"
+	RecipePackage             RecipeName = "package"
+	RecipeProcess             RecipeName = "process"
 )
 
 type Recipe struct {
@@ -118,6 +125,71 @@ func SelectRecipe(userInput string) *Recipe {
 			InitialCommand: cmd,
 			ServiceName:    serviceName,
 		}
+	case IssuePermission:
+		path := ExtractPath(strings.ToLower(userInput))
+		cmd := "id"
+		if path != "" {
+			cmd = fmt.Sprintf("ls -la %s; id", shellEscapeToken(path))
+		}
+		return &Recipe{
+			Name:           RecipePermission,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+			ServiceName:    path,
+		}
+	case IssuePort:
+		cmd := "ss -tlnp"
+		if runtime.GOOS == "darwin" {
+			cmd = "lsof -iTCP -sTCP:LISTEN -P -n"
+		}
+		port := ExtractPort(strings.ToLower(userInput))
+		return &Recipe{
+			Name:           RecipePortConflict,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+			ServiceName:    port,
+		}
+	case IssueSSL:
+		cmd := "openssl s_client -connect localhost:443 </dev/null 2>/dev/null | openssl x509 -noout -dates -subject"
+		return &Recipe{
+			Name:           RecipeSSL,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+		}
+	case IssueGit:
+		return &Recipe{
+			Name:           RecipeGit,
+			IssueClass:     issueClass,
+			InitialCommand: "git status",
+		}
+	case IssueCron:
+		cmd := "crontab -l 2>&1"
+		if runtime.GOOS == "linux" {
+			cmd = "crontab -l 2>&1; systemctl list-timers --no-pager 2>/dev/null | head -20"
+		}
+		return &Recipe{
+			Name:           RecipeCron,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+		}
+	case IssuePackage:
+		cmd := buildPackageCommand()
+		return &Recipe{
+			Name:           RecipePackage,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+		}
+	case IssueProcess:
+		normalized := strings.ToLower(userInput)
+		cmd := "ps aux | grep -E 'Z|defunct' | head -20"
+		if containsAny(normalized, "open files", "ulimit") {
+			cmd = "ulimit -n; lsof 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -10"
+		}
+		return &Recipe{
+			Name:           RecipeProcess,
+			IssueClass:     issueClass,
+			InitialCommand: cmd,
+		}
 	default:
 		return nil
 	}
@@ -139,14 +211,14 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 		return "du -xhd 1 / 2>/dev/null | sort -hr | head -15"
 	case RecipeMemoryPressure:
 		if runtime.GOOS == "darwin" {
-			return "ps aux -armem | head -10"
+			return "ps -eo pid,rss,comm -r | head -10"
 		}
-		return "ps aux --sort=-%mem | head -10"
+		return "ps -eo pid,rss,comm --sort=-rss | head -10"
 	case RecipePerformanceCPU:
 		if runtime.GOOS == "darwin" {
-			return "ps aux -arcpu | head -10"
+			return "ps -eo pid,pcpu,comm -r | head -10"
 		}
-		return "ps aux --sort=-%cpu | head -10"
+		return "ps -eo pid,pcpu,comm --sort=-pcpu | head -10"
 	case RecipeDNSResolution:
 		if runtime.GOOS == "darwin" {
 			return "netstat -rn"
@@ -164,6 +236,34 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 		return fmt.Sprintf("docker logs --tail 40 %s 2>&1", shellEscapeToken(r.ServiceName))
 	case RecipeBuildFailure:
 		return ""
+	case RecipePermission:
+		path := r.ServiceName
+		if path != "" {
+			return fmt.Sprintf("stat %s", shellEscapeToken(path))
+		}
+		return ""
+	case RecipePortConflict:
+		port := r.ServiceName
+		if port != "" {
+			if runtime.GOOS == "darwin" {
+				return fmt.Sprintf("lsof -iTCP:%s -sTCP:LISTEN -P -n", shellEscapeToken(port))
+			}
+			return fmt.Sprintf("ss -tlnp | grep %s", shellEscapeToken(port))
+		}
+		return ""
+	case RecipeSSL:
+		return "date -u"
+	case RecipeGit:
+		return "git log --oneline -5"
+	case RecipeCron:
+		if runtime.GOOS == "darwin" {
+			return "log show --predicate 'process == \"cron\"' --last 10m --style compact 2>/dev/null | tail -20"
+		}
+		return "journalctl -u cron -n 20 --no-pager 2>/dev/null || journalctl -u crond -n 20 --no-pager 2>/dev/null"
+	case RecipePackage:
+		return ""
+	case RecipeProcess:
+		return "lsof 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | head -10"
 	case RecipeServiceFailure:
 		if r.ServiceName == "" {
 			return ""
@@ -218,6 +318,13 @@ func buildCommandForTool(tool string) string {
 	default:
 		return "ls package.json Cargo.toml go.mod Makefile 2>/dev/null"
 	}
+}
+
+func buildPackageCommand() string {
+	if runtime.GOOS == "darwin" {
+		return "brew doctor 2>&1 | head -30"
+	}
+	return "apt list --upgradable 2>/dev/null | head -20 || dpkg --audit 2>/dev/null | head -20"
 }
 
 func looksLikeKnowledgeQuery(input string) bool {

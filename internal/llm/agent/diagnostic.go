@@ -44,21 +44,29 @@ func (d *DiagnosticResult) Render() string {
 // instead of sending it to the model for Pass 2. Returns (rendered diagnostic, true)
 // if successful, or ("", false) to fall through to model Pass 2.
 func tryStructuredDiagnostic(toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
-	if len(toolCalls) != 1 || len(toolResults) == 0 {
+	if len(toolCalls) == 0 || len(toolResults) == 0 {
 		return "", false
 	}
 
-	if toolCalls[0].Name != "bash" {
+	// For multi-tool results, try structured parsing on the last bash tool call
+	lastIdx := -1
+	for i := len(toolCalls) - 1; i >= 0; i-- {
+		if toolCalls[i].Name == "bash" {
+			lastIdx = i
+			break
+		}
+	}
+	if lastIdx < 0 || lastIdx >= len(toolResults) {
 		return "", false
 	}
 
-	command := extractCommand(toolCalls[0].Input)
+	command := extractCommand(toolCalls[lastIdx].Input)
 	if command == "" {
 		return "", false
 	}
 
-	output := stripStreamTags(toolResults[0].Content)
-	if toolResults[0].IsError || output == "" || strings.HasPrefix(output, "Error:") {
+	output := stripStreamTags(toolResults[lastIdx].Content)
+	if toolResults[lastIdx].IsError || output == "" || strings.HasPrefix(output, "Error:") {
 		return "", false
 	}
 
@@ -127,6 +135,20 @@ func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.
 		return parseDockerCrashRecipe(recipe, toolCalls, toolResults)
 	case diagnose.RecipeBuildFailure:
 		return parseBuildFailureRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePermission:
+		return parsePermissionRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePortConflict:
+		return parsePortConflictRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeSSL:
+		return parseSSLRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeGit:
+		return parseGitRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeCron:
+		return parseCronRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePackage:
+		return parsePackageRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeProcess:
+		return parseProcessRecipe(recipe, toolCalls, toolResults)
 	default:
 		return "", false
 	}
@@ -1860,5 +1882,345 @@ func parseBuildAutoDetect(output string) (string, bool) {
 		d.Findings = append(d.Findings, f)
 	}
 	d.Remediation = append(d.Remediation, "Run the build command for the detected project type")
+	return d.Render(), true
+}
+
+func parsePermissionRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+	path := recipe.ServiceName
+	if path == "" {
+		path = "target"
+	}
+
+	permLines := grepLines(output, `(?i)(^[-dlrwxsStT]{10}|permission|denied|uid=|gid=)`)
+	if len(permLines) == 0 {
+		return "", false
+	}
+
+	risk := "Medium"
+	for _, line := range permLines {
+		if strings.Contains(strings.ToLower(line), "denied") {
+			risk = "High"
+			break
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("Permission check for %s", path),
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(permLines, 6) {
+		d.Findings = append(d.Findings, line)
+	}
+	if risk == "High" {
+		d.Remediation = append(d.Remediation, "Check file ownership and permissions with `ls -la`")
+		d.Remediation = append(d.Remediation, "Fix with `chmod` or `chown` as needed")
+	}
+	return d.Render(), true
+}
+
+func parsePortConflictRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+	port := recipe.ServiceName
+
+	lines := firstNonEmptyLines(output, 20)
+	if len(lines) == 0 {
+		return "", false
+	}
+
+	// If a specific port was mentioned, filter for it
+	var relevant []string
+	if port != "" {
+		for _, line := range lines {
+			if strings.Contains(line, ":"+port) || strings.Contains(line, "LISTEN") {
+				relevant = append(relevant, line)
+			}
+		}
+	}
+	if len(relevant) == 0 {
+		relevant = lines
+	}
+
+	risk := "Medium"
+	summary := fmt.Sprintf("Listening ports check")
+	if port != "" {
+		conflictFound := false
+		for _, line := range relevant {
+			if strings.Contains(line, ":"+port) {
+				conflictFound = true
+				break
+			}
+		}
+		if conflictFound {
+			risk = "High"
+			summary = fmt.Sprintf("Port %s is already in use", port)
+		} else {
+			summary = fmt.Sprintf("Port %s is not currently in use", port)
+			risk = "Low"
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(relevant, 8) {
+		d.Findings = append(d.Findings, line)
+	}
+	if risk == "High" {
+		d.Remediation = append(d.Remediation, fmt.Sprintf("Identify and stop the process using port %s, or configure your service to use a different port", port))
+	}
+	return d.Render(), true
+}
+
+var certDateRe = regexp.MustCompile(`(?i)(not(?:Before|After)\s*=\s*.+|subject\s*=\s*.+)`)
+
+func parseSSLRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	certLines := certDateRe.FindAllString(output, -1)
+	if len(certLines) == 0 {
+		// Check if connection failed entirely
+		if strings.Contains(strings.ToLower(output), "connect") && strings.Contains(strings.ToLower(output), "error") {
+			d := DiagnosticResult{
+				Summary:   "SSL connection failed — no certificate retrieved",
+				RiskLevel: "High",
+			}
+			d.Findings = append(d.Findings, "Could not establish SSL/TLS connection")
+			d.Remediation = append(d.Remediation, "Verify the service is running and listening on the expected port with SSL/TLS enabled")
+			return d.Render(), true
+		}
+		return "", false
+	}
+
+	risk := "Low"
+	summary := "SSL certificate details retrieved"
+	for _, line := range certLines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "notafter") {
+			// We can't easily parse the date format here, so just flag it
+			summary = "SSL certificate found — check expiry dates"
+			risk = "Medium"
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(certLines, 4) {
+		d.Findings = append(d.Findings, strings.TrimSpace(line))
+	}
+	// Include date check from follow-up
+	if len(toolResults) >= 2 {
+		dateOutput := strings.TrimSpace(toolResults[1].Content)
+		if dateOutput != "" {
+			d.Findings = append(d.Findings, "Current UTC time: "+dateOutput)
+		}
+	}
+	d.Remediation = append(d.Remediation, "Compare certificate notAfter date with current time to check for expiry")
+	d.Remediation = append(d.Remediation, "Renew the certificate if expired or expiring soon")
+	return d.Render(), true
+}
+
+func parseGitRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	risk := "Low"
+	summary := "Git repository status"
+
+	hasConflict := strings.Contains(output, "both modified") || strings.Contains(output, "Unmerged")
+	hasDetached := strings.Contains(output, "HEAD detached")
+	hasDirty := strings.Contains(output, "Changes not staged") || strings.Contains(output, "Changes to be committed")
+
+	if hasConflict {
+		risk = "High"
+		summary = "Merge conflicts detected"
+	} else if hasDetached {
+		risk = "Medium"
+		summary = "HEAD is in detached state"
+	} else if hasDirty {
+		risk = "Low"
+		summary = "Working directory has uncommitted changes"
+	}
+
+	statusLines := firstNonEmptyLines(output, 8)
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range statusLines {
+		d.Findings = append(d.Findings, line)
+	}
+
+	// Include log from follow-up
+	if len(toolResults) >= 2 {
+		logLines := firstNonEmptyLines(toolResults[1].Content, 5)
+		for _, line := range logLines {
+			d.Findings = append(d.Findings, "log: "+line)
+		}
+	}
+
+	if hasConflict {
+		d.Remediation = append(d.Remediation, "Resolve conflicts in the listed files, then `git add` and `git commit`")
+	} else if hasDetached {
+		d.Remediation = append(d.Remediation, "Create a branch to save work: `git checkout -b <branch-name>`")
+	} else if hasDirty {
+		d.Remediation = append(d.Remediation, "Commit or stash changes before proceeding: `git stash` or `git commit -am 'message'`")
+	}
+	return d.Render(), true
+}
+
+func parseCronRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	noCrontab := strings.Contains(strings.ToLower(output), "no crontab")
+	lines := firstNonEmptyLines(output, 10)
+	if len(lines) == 0 {
+		return "", false
+	}
+
+	risk := "Low"
+	summary := "Cron configuration"
+	if noCrontab {
+		summary = "No crontab entries for current user"
+	} else {
+		// Count actual cron entries (lines not starting with #)
+		entryCount := 0
+		for _, line := range lines {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+				entryCount++
+			}
+		}
+		summary = fmt.Sprintf("%d cron entries found", entryCount)
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(lines, 8) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(toolResults) >= 2 {
+		logLines := grepLines(toolResults[1].Content, `(?i)(error|failed|no mta|cannot|denied)`)
+		for _, line := range firstN(logLines, 4) {
+			d.Findings = append(d.Findings, "log: "+line)
+			risk = "Medium"
+		}
+	}
+	d.RiskLevel = risk
+	if noCrontab {
+		d.Remediation = append(d.Remediation, "Create a crontab with `crontab -e`")
+	} else {
+		d.Remediation = append(d.Remediation, "Review cron timing and command paths for correctness")
+	}
+	return d.Render(), true
+}
+
+func parsePackageRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+	lines := firstNonEmptyLines(output, 15)
+	if len(lines) == 0 {
+		return "", false
+	}
+
+	errorLines := grepLines(output, `(?i)(error|warning|broken|locked|dpkg was interrupted|E:)`)
+	risk := "Low"
+	summary := "Package manager status"
+	if len(errorLines) > 0 {
+		risk = "High"
+		summary = "Package manager issues detected"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	if len(errorLines) > 0 {
+		for _, line := range firstN(errorLines, 6) {
+			d.Findings = append(d.Findings, line)
+		}
+	} else {
+		for _, line := range firstN(lines, 8) {
+			d.Findings = append(d.Findings, line)
+		}
+	}
+	if risk == "High" {
+		d.Remediation = append(d.Remediation, "Fix broken packages: `sudo dpkg --configure -a` or `brew cleanup`")
+		d.Remediation = append(d.Remediation, "Clear package locks if present")
+	}
+	return d.Render(), true
+}
+
+func parseProcessRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+	lines := firstNonEmptyLines(output, 15)
+	if len(lines) == 0 {
+		return "", false
+	}
+
+	// Check for zombie processes
+	zombieLines := grepLines(output, `(?i)(Z|defunct)`)
+	hasZombies := len(zombieLines) > 0
+
+	// Check for ulimit info
+	hasUlimit := false
+	for _, line := range lines {
+		if _, err := strconv.Atoi(strings.TrimSpace(line)); err == nil {
+			hasUlimit = true
+			break
+		}
+	}
+
+	risk := "Low"
+	summary := "Process health check"
+	if hasZombies {
+		risk = "Medium"
+		summary = fmt.Sprintf("%d zombie/defunct process(es) detected", len(zombieLines))
+	} else if hasUlimit {
+		summary = "File descriptor limits and top consumers"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstN(lines, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(toolResults) >= 2 {
+		fdLines := firstNonEmptyLines(toolResults[1].Content, 6)
+		for _, line := range fdLines {
+			d.Findings = append(d.Findings, "fd count: "+line)
+		}
+	}
+	if hasZombies {
+		d.Remediation = append(d.Remediation, "Identify the parent process of zombies and restart it, or send SIGCHLD")
+	}
+	if hasUlimit {
+		d.Remediation = append(d.Remediation, "Increase file descriptor limit if needed: edit `/etc/security/limits.conf` or use `ulimit -n <value>`")
+	}
 	return d.Render(), true
 }

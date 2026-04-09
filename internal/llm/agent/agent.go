@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ var knowledgePattern = regexp.MustCompile(`(?i)^(what is|what are|what does|expl
 // numericPattern matches numbers with units (e.g., "78%", "22G", "512Mi", "3.8Gi")
 // used to detect fabricated values in model output.
 var numericPattern = regexp.MustCompile(`\d+(?:\.\d+)?%|\d+(?:\.\d+)?[GMKT]i?[Bb]?`)
+
+// percentPattern matches N% values in tool output for smart summarization.
+var percentPattern = regexp.MustCompile(`(\d+)%`)
 
 type AgentEventType string
 
@@ -118,13 +122,19 @@ func NewAgent(
 		}
 	}
 
+	// Use slim tool descriptions for local models to save ~400 tokens
+	effectiveTools := agentTools
+	if agentProvider.Model().Provider == models.ProviderLocal {
+		effectiveTools = tools.WrapToolsForLocalModel(agentTools)
+	}
+
 	agent := &agent{
 		Broker:             pubsub.NewBroker[AgentEvent](),
 		provider:           agentProvider,
 		diagnosticProvider: diagnosticProvider,
 		messages:           messages,
 		sessions:           sessions,
-		tools:              agentTools,
+		tools:              effectiveTools,
 		titleProvider:      titleProvider,
 		summarizeProvider:  summarizeProvider,
 		activeRequests:     sync.Map{},
@@ -253,6 +263,15 @@ func (a *agent) Run(ctx context.Context, sessionID string, content string, attac
 	return events, nil
 }
 
+// maxIterations is the maximum number of tool-call rounds before forcing diagnosis.
+const maxIterations = 3
+
+// maxEvidenceBytes caps the total accumulated tool output to prevent context overflow.
+const maxEvidenceBytes = 3000
+
+// perResultCap limits individual tool result size before accumulation.
+const perResultCap = 1500
+
 func (a *agent) processGeneration(ctx context.Context, sessionID, content string, attachmentParts []message.ContentPart) AgentEvent {
 	// List existing messages; if none, start title generation asynchronously.
 	msgs, err := a.messages.List(ctx, sessionID)
@@ -302,115 +321,183 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	default:
 	}
 
-	// PASS 1: Tool selection.
-	// For obvious troubleshooting intents, bypass the model and route directly
-	// to a bounded first probe. This is much more reliable for a 0.8B model.
-	pass1Tools := a.tools
-	var pass1Response *provider.ProviderResponse
-	if isKnowledgeQuery(content) {
-		pass1Tools = nil
-	}
-	var routedRecipe *diagnose.Recipe
-	if pass1Response == nil {
-		routedRecipe = diagnose.SelectRecipe(content)
-		if routed := routeDiagnosticIntent(routedRecipe); routed != nil {
-			pass1Response = &provider.ProviderResponse{
-				ToolCalls:    []message.ToolCall{*routed},
-				FinishReason: message.FinishReasonToolUse,
-			}
-			logging.Info("Pass 1 routed deterministically", "recipe", routedRecipe.Name, "tool", routed.Name, "input", routed.Input)
-		}
-	}
-	if pass1Response == nil {
-		// llama-server's grammar-based tool parsing only works reliably with
-		// non-streaming requests. With streaming, tool call XML is sent as
-		// content deltas and not parsed into tool_calls.
-		pass1Response, err = a.provider.SendMessages(ctx, msgHistory, pass1Tools)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return a.err(ErrRequestCancelled)
-			}
-			return a.err(fmt.Errorf("failed to send pass 1 messages: %w", err))
-		}
-	}
-
-	// Save the pass 1 response as an assistant message
-	agentMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
-		Role:  message.Assistant,
-		Parts: []message.ContentPart{message.TextContent{Text: pass1Response.Content}},
-		Model: a.provider.Model().ID,
-	})
-	if err != nil {
-		return a.err(fmt.Errorf("failed to create pass 1 message: %w", err))
-	}
-	agentMessage.SetToolCalls(pass1Response.ToolCalls)
-	agentMessage.AddFinish(pass1Response.FinishReason)
-	if err := a.messages.Update(ctx, agentMessage); err != nil {
-		return a.err(fmt.Errorf("failed to update pass 1 message: %w", err))
-	}
-
-	logging.Info("Pass 1 result", "finishReason", pass1Response.FinishReason, "toolCalls", len(pass1Response.ToolCalls), "content", pass1Response.Content)
-
-	// If no tool calls, return directly (knowledge question or text-only response)
-	if pass1Response.FinishReason != message.FinishReasonToolUse || len(pass1Response.ToolCalls) == 0 {
-		return AgentEvent{
-			Type:    AgentEventTypeResponse,
-			Message: agentMessage,
-			Done:    true,
-		}
-	}
-
-	// Execute the tool calls — set session/message context required by tools (e.g., bash)
+	// Set up context for tool execution
 	ctx = context.WithValue(ctx, tools.SessionIDContextKey, sessionID)
-	ctx = context.WithValue(ctx, tools.MessageIDContextKey, agentMessage.ID)
-	var toolResults *message.Message
-	for _, tc := range pass1Response.ToolCalls {
-		toolResults, err = a.executeToolCall(ctx, sessionID, tc, toolResults)
-		if err != nil {
-			return a.err(err)
-		}
-	}
 
-	if routedRecipe != nil && toolResults != nil {
-		if followUpCommand := routedRecipe.FollowUpCommand(toolResultContent(toolResults)); followUpCommand != "" {
-			followUp := newBashToolCall(fmt.Sprintf("%s_follow_up", routedRecipe.Name), followUpCommand)
-			agentMessage.AddToolCall(*followUp)
-			if err := a.messages.Update(ctx, agentMessage); err != nil {
-				return a.err(fmt.Errorf("failed to update pass 1 message with follow-up: %w", err))
+	// Accumulated state across iterations
+	var allToolCalls []message.ToolCall
+	var allToolResults []message.ToolResult
+	var allToolResultMsgs []*message.Message
+	var routedRecipe *diagnose.Recipe
+	totalEvidenceLen := 0
+
+	// MULTI-TURN TOOL LOOP: up to maxIterations rounds
+	for iteration := 0; iteration < maxIterations; iteration++ {
+		var response *provider.ProviderResponse
+		pass1Tools := a.tools
+
+		if isKnowledgeQuery(content) {
+			pass1Tools = nil
+		}
+
+		// Iteration 0: recipe routing OR model pass1
+		if iteration == 0 {
+			routedRecipe = diagnose.SelectRecipe(content)
+			if routed := routeDiagnosticIntent(routedRecipe); routed != nil {
+				response = &provider.ProviderResponse{
+					ToolCalls:    []message.ToolCall{*routed},
+					FinishReason: message.FinishReasonToolUse,
+				}
+				logging.Info("Iteration 0 routed deterministically", "recipe", routedRecipe.Name, "tool", routed.Name, "input", routed.Input)
 			}
-			logging.Info("Executing deterministic follow-up", "recipe", routedRecipe.Name, "command", followUpCommand)
-			toolResults, err = a.executeToolCall(ctx, sessionID, *followUp, toolResults)
+			if response == nil {
+				response, err = a.provider.SendMessages(ctx, msgHistory, pass1Tools)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return a.err(ErrRequestCancelled)
+					}
+					return a.err(fmt.Errorf("failed to send iteration %d messages: %w", iteration, err))
+				}
+			}
+		} else {
+			// Iterations 1+: fresh context with accumulated evidence
+			iterCtx := buildIterationContext(content, routedRecipe, allToolCalls, allToolResults, maxIterations-iteration)
+			iterMsg, iterErr := a.createUserMessage(ctx, sessionID, iterCtx, nil)
+			if iterErr != nil {
+				return a.err(fmt.Errorf("failed to create iteration %d message: %w", iteration, iterErr))
+			}
+			response, err = a.provider.SendMessages(ctx, []message.Message{iterMsg}, pass1Tools)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return a.err(ErrRequestCancelled)
+				}
+				return a.err(fmt.Errorf("failed to send iteration %d messages: %w", iteration, err))
+			}
+		}
+
+		// Save the response as an assistant message
+		agentMessage, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+			Role:  message.Assistant,
+			Parts: []message.ContentPart{message.TextContent{Text: response.Content}},
+			Model: a.provider.Model().ID,
+		})
+		if createErr != nil {
+			return a.err(fmt.Errorf("failed to create iteration %d message: %w", iteration, createErr))
+		}
+		agentMessage.SetToolCalls(response.ToolCalls)
+		agentMessage.AddFinish(response.FinishReason)
+		ctx = context.WithValue(ctx, tools.MessageIDContextKey, agentMessage.ID)
+		if err := a.messages.Update(ctx, agentMessage); err != nil {
+			return a.err(fmt.Errorf("failed to update iteration %d message: %w", iteration, err))
+		}
+
+		logging.Info("Iteration result", "iteration", iteration, "finishReason", response.FinishReason, "toolCalls", len(response.ToolCalls), "content", response.Content)
+
+		// If no tool calls, return directly (knowledge question or text-only response)
+		if response.FinishReason != message.FinishReasonToolUse || len(response.ToolCalls) == 0 {
+			// If we have accumulated evidence, go to Pass 2 instead
+			if len(allToolCalls) > 0 {
+				break
+			}
+			return AgentEvent{
+				Type:    AgentEventTypeResponse,
+				Message: agentMessage,
+				Done:    true,
+			}
+		}
+
+		// Execute the tool calls
+		var toolResults *message.Message
+		for _, tc := range response.ToolCalls {
+			toolResults, err = a.executeToolCall(ctx, sessionID, tc, toolResults)
 			if err != nil {
 				return a.err(err)
 			}
 		}
-	}
 
-	if toolResults != nil {
-		if err := a.messages.Update(ctx, *toolResults); err != nil {
-			return a.err(fmt.Errorf("failed to update tool results: %w", err))
+		// Recipe follow-up (only on iteration 0)
+		if iteration == 0 && routedRecipe != nil && toolResults != nil {
+			if followUpCommand := routedRecipe.FollowUpCommand(toolResultContent(toolResults)); followUpCommand != "" {
+				followUp := newBashToolCall(fmt.Sprintf("%s_follow_up", routedRecipe.Name), followUpCommand)
+				agentMessage.AddToolCall(*followUp)
+				if err := a.messages.Update(ctx, agentMessage); err != nil {
+					return a.err(fmt.Errorf("failed to update message with follow-up: %w", err))
+				}
+				logging.Info("Executing deterministic follow-up", "recipe", routedRecipe.Name, "command", followUpCommand)
+				toolResults, err = a.executeToolCall(ctx, sessionID, *followUp, toolResults)
+				if err != nil {
+					return a.err(err)
+				}
+			}
+		}
+
+		if toolResults != nil {
+			if err := a.messages.Update(ctx, *toolResults); err != nil {
+				return a.err(fmt.Errorf("failed to update tool results: %w", err))
+			}
+		}
+
+		// Accumulate tool calls and results
+		for _, tc := range agentMessage.ToolCalls() {
+			allToolCalls = append(allToolCalls, tc)
+		}
+		if toolResults != nil {
+			for _, tr := range toolResults.ToolResults() {
+				truncated := truncateToolResult(tr.Content, perResultCap)
+				totalEvidenceLen += len(truncated)
+				allToolResults = append(allToolResults, message.ToolResult{
+					ToolCallID: tr.ToolCallID,
+					Content:    truncated,
+					IsError:    tr.IsError,
+				})
+			}
+			allToolResultMsgs = append(allToolResultMsgs, toolResults)
+		}
+
+		// Budget guard: stop if total evidence exceeds cap
+		if totalEvidenceLen > maxEvidenceBytes {
+			logging.Info("Evidence budget exceeded, proceeding to diagnosis", "totalLen", totalEvidenceLen)
+			break
+		}
+
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return a.err(ctx.Err())
+		default:
 		}
 	}
 
-	// PASS 2: Diagnostic generation (no tools, fresh context with tool output)
-	// Build a new prompt that includes the original question + tool results.
-	// No tool definitions are sent — forces text-only generation and saves ~4000 tokens.
-	toolOutput := toolResultContent(toolResults)
+	// PASS 2: Diagnostic generation
+	if len(allToolCalls) == 0 {
+		// Should not normally happen, but defensive
+		return a.err(fmt.Errorf("no tool calls after iteration loop"))
+	}
+
+	// Collect all tool output for fabrication checking
+	var allToolOutput strings.Builder
+	for _, tr := range allToolResults {
+		allToolOutput.WriteString(tr.Content)
+		allToolOutput.WriteString("\n")
+	}
+	toolOutput := allToolOutput.String()
+	if len(toolOutput) > 4000 {
+		toolOutput = toolOutput[:4000]
+	}
 
 	// Try structured diagnostic first — deterministic parsing, zero fabrication.
-	// Falls through to model Pass 2 for unrecognized commands.
-	if structured, ok := tryStructuredDiagnostic(agentMessage.ToolCalls(), toolResults.ToolResults()); ok {
-		return a.returnStructuredDiagnostic(ctx, sessionID, structured)
+	if structured, ok := tryStructuredDiagnostic(allToolCalls, allToolResults); ok {
+		return a.finishWithRemediation(ctx, sessionID, structured, allToolCalls, allToolResults)
 	}
-	if structured, ok := tryStructuredRecipeDiagnostic(routedRecipe, agentMessage.ToolCalls(), toolResults.ToolResults()); ok {
-		return a.returnStructuredDiagnostic(ctx, sessionID, structured)
+	if structured, ok := tryStructuredRecipeDiagnostic(routedRecipe, allToolCalls, allToolResults); ok {
+		return a.finishWithRemediation(ctx, sessionID, structured, allToolCalls, allToolResults)
 	}
 
 	// Fallback: model-based Pass 2 for unrecognized commands
-	pass2Content := buildPass2Content(content, routedRecipe, agentMessage.ToolCalls(), toolResults.ToolResults())
-	pass2Msg, err := a.createUserMessage(ctx, sessionID, pass2Content, nil)
-	if err != nil {
-		return a.err(fmt.Errorf("failed to create pass 2 user message: %w", err))
+	pass2Content := buildPass2Content(content, routedRecipe, allToolCalls, allToolResults)
+	pass2Msg, pass2Err := a.createUserMessage(ctx, sessionID, pass2Content, nil)
+	if pass2Err != nil {
+		return a.err(fmt.Errorf("failed to create pass 2 user message: %w", pass2Err))
 	}
 	pass2History := []message.Message{pass2Msg}
 
@@ -419,29 +506,36 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	if a.diagnosticProvider != nil {
 		diagnosticProvider = a.diagnosticProvider
 	}
-	pass2Response, err := diagnosticProvider.SendMessages(ctx, pass2History, nil)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
+	pass2Response, pass2Err := diagnosticProvider.SendMessages(ctx, pass2History, nil)
+	if pass2Err != nil {
+		if errors.Is(pass2Err, context.Canceled) {
 			return a.err(ErrRequestCancelled)
 		}
-		return a.err(fmt.Errorf("failed to generate diagnostic: %w", err))
+		return a.err(fmt.Errorf("failed to generate diagnostic: %w", pass2Err))
 	}
 
 	// Truncate repetitive output from small models, then strip lines containing
 	// fabricated numeric values (numbers not present in the original tool output).
 	diagnosticContent := stripFabricatedValues(truncateRepetition(pass2Response.Content), toolOutput)
 
-	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
+	diagnosticMessage, createErr := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 		Role:  message.Assistant,
 		Parts: []message.ContentPart{message.TextContent{Text: diagnosticContent}},
 		Model: diagnosticProvider.Model().ID,
 	})
-	if err != nil {
-		return a.err(fmt.Errorf("failed to create diagnostic message: %w", err))
+	if createErr != nil {
+		return a.err(fmt.Errorf("failed to create diagnostic message: %w", createErr))
 	}
 	diagnosticMessage.AddFinish(pass2Response.FinishReason)
 	if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
 		return a.err(fmt.Errorf("failed to update diagnostic message: %w", err))
+	}
+
+	// Try remediation if fix mode is enabled
+	if config.Get().FixMode {
+		if remResult := a.tryRemediation(ctx, sessionID, diagnosticContent, allToolCalls, allToolResults); remResult != nil {
+			return *remResult
+		}
 	}
 
 	return AgentEvent{
@@ -451,10 +545,11 @@ func (a *agent) processGeneration(ctx context.Context, sessionID, content string
 	}
 }
 
-func (a *agent) returnStructuredDiagnostic(ctx context.Context, sessionID, text string) AgentEvent {
+// finishWithRemediation returns a structured diagnostic, optionally followed by remediation.
+func (a *agent) finishWithRemediation(ctx context.Context, sessionID, diagnosticText string, allToolCalls []message.ToolCall, allToolResults []message.ToolResult) AgentEvent {
 	diagnosticMessage, err := a.messages.Create(ctx, sessionID, message.CreateMessageParams{
 		Role:  message.Assistant,
-		Parts: []message.ContentPart{message.TextContent{Text: text}},
+		Parts: []message.ContentPart{message.TextContent{Text: diagnosticText}},
 		Model: a.provider.Model().ID,
 	})
 	if err != nil {
@@ -464,8 +559,124 @@ func (a *agent) returnStructuredDiagnostic(ctx context.Context, sessionID, text 
 	if err := a.messages.Update(ctx, diagnosticMessage); err != nil {
 		return a.err(fmt.Errorf("failed to update diagnostic message: %w", err))
 	}
+
+	// Try remediation if fix mode is enabled
+	if config.Get().FixMode {
+		if remResult := a.tryRemediation(ctx, sessionID, diagnosticText, allToolCalls, allToolResults); remResult != nil {
+			return *remResult
+		}
+	}
+
 	return AgentEvent{Type: AgentEventTypeResponse, Message: diagnosticMessage, Done: true}
 }
+
+// buildIterationContext builds a compact prompt for iterations 1+ with accumulated evidence.
+func buildIterationContext(userContent string, recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult, remainingProbes int) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("User issue: %s\n\n", userContent))
+	b.WriteString("Evidence so far:\n")
+	for i := 0; i < len(toolCalls) && i < len(toolResults); i++ {
+		command := extractCommand(toolCalls[i].Input)
+		if command == "" {
+			command = toolCalls[i].Name
+		}
+		summary := smartSummarize(recipe, command, toolResults[i].Content)
+		b.WriteString(fmt.Sprintf("- `%s` → %s\n", command, strings.TrimSpace(summary)))
+	}
+	b.WriteString(fmt.Sprintf("\nYou have %d more probe(s). Call a tool to gather more evidence, or respond with text to diagnose.\n", remainingProbes))
+	return b.String()
+}
+
+// smartSummarize produces a compact summary of tool output, using context-aware
+// extraction for known commands to maximize information density within ~200 chars.
+func smartSummarize(recipe *diagnose.Recipe, command, output string) string {
+	// Try context-aware summaries for common commands first
+	if s := summarizeCommandSmart(command, output); s != "" {
+		return s
+	}
+	// Fall back to recipe-specific summarizers
+	if recipe != nil {
+		if s := summarizeProbe(recipe, command, output); s != "" {
+			return s
+		}
+	}
+	// Generic fallback
+	if s := summarizeGenericOutput(output); s != "" {
+		return s
+	}
+	// Last resort: first 200 chars
+	if len(output) > 200 {
+		return output[:200] + "..."
+	}
+	return output
+}
+
+// summarizeCommandSmart extracts the most diagnostic signal from known commands.
+func summarizeCommandSmart(command, output string) string {
+	if strings.TrimSpace(output) == "" {
+		return ""
+	}
+	// df -h: extract only partitions above 80%
+	if strings.HasPrefix(command, "df") {
+		var high []string
+		for _, line := range strings.Split(output, "\n") {
+			for _, m := range percentPattern.FindAllStringSubmatch(line, -1) {
+				if len(m) >= 2 {
+					pct, _ := strconv.Atoi(m[1])
+					if pct >= 80 {
+						fields := strings.Fields(line)
+						if len(fields) > 0 {
+							high = append(high, fmt.Sprintf("%s at %d%%", fields[len(fields)-1], pct))
+						}
+					}
+				}
+			}
+		}
+		if len(high) > 0 {
+			return strings.Join(high, ", ")
+		}
+		return "all partitions below 80%"
+	}
+	// ps: just top 3 processes
+	if strings.HasPrefix(command, "ps") {
+		lines := firstNonEmptyLines(output, 4) // header + 3
+		if len(lines) > 1 {
+			return strings.Join(lines[1:], "; ")
+		}
+	}
+	// git status: modified/untracked count
+	if strings.HasPrefix(command, "git status") {
+		modified := len(grepLines(output, `modified:`))
+		untracked := len(grepLines(output, `Untracked files`))
+		conflicts := len(grepLines(output, `both modified`))
+		parts := []string{}
+		if conflicts > 0 {
+			parts = append(parts, fmt.Sprintf("%d conflicts", conflicts))
+		}
+		if modified > 0 {
+			parts = append(parts, fmt.Sprintf("%d modified", modified))
+		}
+		if untracked > 0 {
+			parts = append(parts, "has untracked files")
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, ", ")
+		}
+		return "clean working directory"
+	}
+	return ""
+}
+
+// truncateToolResult smartly truncates a tool result to maxLen chars,
+// keeping the first and last portions for context.
+func truncateToolResult(content string, maxLen int) string {
+	if len(content) <= maxLen {
+		return content
+	}
+	half := maxLen / 2
+	return content[:half] + "\n... (truncated) ...\n" + content[len(content)-half:]
+}
+
 
 func (a *agent) createUserMessage(ctx context.Context, sessionID, content string, attachmentParts []message.ContentPart) (message.Message, error) {
 	parts := []message.ContentPart{message.TextContent{Text: content}}
@@ -792,8 +1003,15 @@ func sanitizeToolInput(toolName, input string) string {
 		if !ok {
 			return input
 		}
-		// Take first line only, trim spaces
+		// Normalize literal \n, take first line only, trim spaces
+		fp = strings.ReplaceAll(fp, `\n`, "\n")
 		fp = strings.TrimSpace(strings.Split(fp, "\n")[0])
+		// Strip quotes and non-path characters
+		fp = strings.Trim(fp, "\"'`")
+		// Reject obviously invalid paths (hallucinated descriptions, spaces-only, etc.)
+		if fp == "" || strings.ContainsAny(fp, "\t") || !strings.ContainsAny(fp, "/.") {
+			return input
+		}
 		clean := map[string]interface{}{"file_path": fp}
 		if offset, ok := parsed["offset"]; ok {
 			clean["offset"] = offset
@@ -820,14 +1038,14 @@ func toolCallSummary(msg message.Message) string {
 	return strings.Join(parts, ", ")
 }
 
-// toolResultContent extracts text content from tool results, capped at 2000 chars.
+// toolResultContent extracts text content from tool results, capped at 4000 chars.
 func toolResultContent(msg *message.Message) string {
 	var content string
 	for _, tr := range msg.ToolResults() {
 		content += tr.Content + "\n"
 	}
-	if len(content) > 2000 {
-		content = content[:2000] + "\n... (truncated)"
+	if len(content) > 4000 {
+		content = content[:4000] + "\n... (truncated)"
 	}
 	return content
 }

@@ -32,9 +32,9 @@ func TestRecipeFollowUpCommand(t *testing.T) {
 	perfRecipe := SelectRecipe("system is very slow")
 	require.NotNil(t, perfRecipe)
 	if runtime.GOOS == "darwin" {
-		assert.Equal(t, "ps aux -arcpu | head -10", perfRecipe.FollowUpCommand("load averages: 8.0 7.0 6.0"))
+		assert.Equal(t, "ps -eo pid,pcpu,comm -r | head -10", perfRecipe.FollowUpCommand("load averages: 8.0 7.0 6.0"))
 	} else {
-		assert.Equal(t, "ps aux --sort=-%cpu | head -10", perfRecipe.FollowUpCommand("load average: 8.0, 7.0, 6.0"))
+		assert.Equal(t, "ps -eo pid,pcpu,comm --sort=-pcpu | head -10", perfRecipe.FollowUpCommand("load average: 8.0, 7.0, 6.0"))
 	}
 
 	serviceRecipe := SelectRecipe("postgres keeps crashing")

@@ -200,15 +200,15 @@ func TestToolResultContent(t *testing.T) {
 		assert.Contains(t, result, "result 2")
 	})
 
-	t.Run("truncation at 2000 chars", func(t *testing.T) {
-		longContent := strings.Repeat("x", 2500)
+	t.Run("truncation at 4000 chars", func(t *testing.T) {
+		longContent := strings.Repeat("x", 5000)
 		msg := message.Message{
 			Parts: []message.ContentPart{
 				message.ToolResult{ToolCallID: "1", Content: longContent},
 			},
 		}
 		result := toolResultContent(&msg)
-		assert.True(t, len(result) < 2500, "result should be truncated")
+		assert.True(t, len(result) < 5000, "result should be truncated")
 		assert.Contains(t, result, "... (truncated)")
 	})
 

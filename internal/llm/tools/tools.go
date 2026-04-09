@@ -71,6 +71,44 @@ type BaseTool interface {
 	Run(ctx context.Context, params ToolCall) (ToolResponse, error)
 }
 
+// SlimToolWrapper wraps a BaseTool with a shorter description for local models.
+// This saves ~400 tokens in the prompt, leaving more room for evidence.
+type SlimToolWrapper struct {
+	inner       BaseTool
+	description string
+}
+
+func (s *SlimToolWrapper) Info() ToolInfo {
+	info := s.inner.Info()
+	info.Description = s.description
+	return info
+}
+
+func (s *SlimToolWrapper) Run(ctx context.Context, params ToolCall) (ToolResponse, error) {
+	return s.inner.Run(ctx, params)
+}
+
+// SlimDescriptions maps tool names to compact descriptions for local models.
+var SlimDescriptions = map[string]string{
+	"bash": "Run a shell command and return its output. Banned commands: curl, wget, nc, telnet. Use for system inspection: df, ps, ss, systemctl, docker, git, lsof, openssl, etc.",
+	"view": "Read a file and return its contents. Use for config files, logs, /etc/* files.",
+	"grep": "Search file contents for a regex pattern. Returns matching lines.",
+	"glob": "Find files matching a glob pattern. Returns file paths.",
+}
+
+// WrapToolsForLocalModel returns tools with slim descriptions for local model inference.
+func WrapToolsForLocalModel(baseTools []BaseTool) []BaseTool {
+	result := make([]BaseTool, len(baseTools))
+	for i, t := range baseTools {
+		if desc, ok := SlimDescriptions[t.Info().Name]; ok {
+			result[i] = &SlimToolWrapper{inner: t, description: desc}
+		} else {
+			result[i] = t
+		}
+	}
+	return result
+}
+
 func GetContextValues(ctx context.Context) (string, string) {
 	sessionID := ctx.Value(SessionIDContextKey)
 	messageID := ctx.Value(MessageIDContextKey)

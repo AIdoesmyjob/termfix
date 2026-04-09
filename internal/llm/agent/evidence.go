@@ -100,6 +100,20 @@ func summarizeProbe(recipe *diagnose.Recipe, command, output string) string {
 		return summarizeDockerProbe(command, output)
 	case diagnose.RecipeBuildFailure:
 		return summarizeBuildProbe(command, output)
+	case diagnose.RecipePermission:
+		return summarizePermissionProbe(command, output)
+	case diagnose.RecipePortConflict:
+		return summarizePortProbe(command, output)
+	case diagnose.RecipeSSL:
+		return summarizeSSLProbe(command, output)
+	case diagnose.RecipeGit:
+		return summarizeGitProbe(command, output)
+	case diagnose.RecipeCron:
+		return summarizeCronProbe(command, output)
+	case diagnose.RecipePackage:
+		return summarizePackageProbe(command, output)
+	case diagnose.RecipeProcess:
+		return summarizeProcessProbe(command, output)
 	default:
 		return ""
 	}
@@ -300,6 +314,84 @@ func summarizeBuildProbe(command, output string) string {
 	return ""
 }
 
+func summarizePermissionProbe(command, output string) string {
+	lines := grepLines(output, `(?i)(^[-dlrwxsStT]{10}|permission|denied|uid=|gid=)`)
+	if len(lines) > 0 {
+		return "- Permission info:\n" + bulletLines(firstN(lines, 4))
+	}
+	return ""
+}
+
+func summarizePortProbe(command, output string) string {
+	if strings.Contains(command, "lsof") || strings.Contains(command, "ss") {
+		lines := firstNonEmptyLines(output, 8)
+		if len(lines) > 0 {
+			return "- Listening ports:\n" + bulletLines(lines)
+		}
+	}
+	return ""
+}
+
+func summarizeSSLProbe(command, output string) string {
+	lines := grepLines(output, `(?i)(not(?:Before|After)|subject|issuer|expire)`)
+	if len(lines) > 0 {
+		return "- Certificate info:\n" + bulletLines(firstN(lines, 4))
+	}
+	return ""
+}
+
+func summarizeGitProbe(command, output string) string {
+	if strings.Contains(command, "git status") {
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Git status:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "git log") {
+		lines := firstNonEmptyLines(output, 5)
+		if len(lines) > 0 {
+			return "- Recent commits:\n" + bulletLines(lines)
+		}
+	}
+	return ""
+}
+
+func summarizeCronProbe(command, output string) string {
+	lines := firstNonEmptyLines(output, 6)
+	if len(lines) > 0 {
+		return "- Cron entries:\n" + bulletLines(lines)
+	}
+	return ""
+}
+
+func summarizePackageProbe(command, output string) string {
+	errorLines := grepLines(output, `(?i)(error|warning|broken|locked|E:)`)
+	if len(errorLines) > 0 {
+		return "- Package issues:\n" + bulletLines(firstN(errorLines, 4))
+	}
+	lines := firstNonEmptyLines(output, 4)
+	if len(lines) > 0 {
+		return "- Package status:\n" + bulletLines(lines)
+	}
+	return ""
+}
+
+func summarizeProcessProbe(command, output string) string {
+	if strings.Contains(command, "ps") || strings.Contains(command, "zombie") || strings.Contains(command, "defunct") {
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- Process listing:\n" + bulletLines(lines)
+		}
+	}
+	if strings.Contains(command, "ulimit") || strings.Contains(command, "lsof") {
+		lines := firstNonEmptyLines(output, 6)
+		if len(lines) > 0 {
+			return "- File descriptor info:\n" + bulletLines(lines)
+		}
+	}
+	return ""
+}
+
 func summarizeGenericOutput(output string) string {
 	lines := firstNonEmptyLines(output, 5)
 	if len(lines) == 0 {
@@ -329,8 +421,8 @@ func joinToolResults(toolResults []message.ToolResult) string {
 		}
 	}
 	content := b.String()
-	if len(content) > 2000 {
-		content = content[:2000] + "\n... (truncated)"
+	if len(content) > 4000 {
+		content = content[:4000] + "\n... (truncated)"
 	}
 	return strings.TrimSpace(content)
 }

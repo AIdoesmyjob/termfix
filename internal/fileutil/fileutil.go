@@ -28,7 +28,7 @@ func init() {
 	}
 	fzfPath, err = exec.LookPath("fzf")
 	if err != nil {
-		logging.Warn("FZF not found in $PATH. Some features might be limited or slower.")
+		logging.Debug("FZF not found in $PATH, fuzzy file completion disabled")
 		fzfPath = ""
 	}
 }
