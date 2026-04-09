@@ -34,8 +34,8 @@ var remediationBanned = []string{
 	"/etc/shadow",
 	"/boot/",
 	":(){ :",
-	"chmod -R 777 /",
-	"chown -R",
+	"chmod -r 777 /",
+	"chown -r",
 }
 
 // isRemediationBanned checks if a command matches any banned remediation pattern.
