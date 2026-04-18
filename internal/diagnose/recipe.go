@@ -3,7 +3,6 @@ package diagnose
 import (
 	"fmt"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -70,7 +69,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueMemory:
 		cmd := "free -h"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "vm_stat"
 		}
 		return &Recipe{
@@ -95,7 +94,7 @@ func SelectRecipe(userInput string) *Recipe {
 			}
 		}
 		cmd := "cat /etc/resolv.conf"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "scutil --dns"
 		}
 		return &Recipe{
@@ -105,7 +104,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueNetwork:
 		cmd := "ip -o addr show"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "ifconfig"
 		}
 		return &Recipe{
@@ -136,11 +135,11 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueService:
 		cmd := "systemctl --failed --no-pager --plain 2>/dev/null || service --status-all 2>/dev/null || grep -iE 'error|fatal|fail' /var/log/syslog /var/log/messages 2>/dev/null | tail -20"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "launchctl list | head -50"
 		}
 		if serviceName != "" {
-			if runtime.GOOS == "darwin" {
+			if osPlatform == "darwin" {
 				cmd = fmt.Sprintf("launchctl list | grep -i %s", shellEscapeToken(serviceName))
 			} else {
 				cmd = fmt.Sprintf("systemctl status %s --no-pager --full -n 20 2>/dev/null || service %s status 2>/dev/null || grep -i %s /var/log/syslog /var/log/messages 2>/dev/null | tail -20",
@@ -181,7 +180,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssuePort:
 		cmd := "ss -tlnp"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "lsof -iTCP -sTCP:LISTEN -P -n"
 		}
 		port := ExtractPort(strings.ToLower(userInput))
@@ -206,7 +205,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueCron:
 		cmd := "crontab -l 2>&1"
-		if runtime.GOOS == "linux" {
+		if osPlatform == "linux" {
 			cmd = "crontab -l 2>&1; systemctl list-timers --no-pager 2>/dev/null | head -20"
 		}
 		return &Recipe{
@@ -240,7 +239,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueTime:
 		cmd := "timedatectl status 2>/dev/null || date -u"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "sntp -d pool.ntp.org 2>&1 | head -5; date -u"
 		}
 		return &Recipe{
@@ -250,7 +249,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueLog:
 		cmd := "journalctl --disk-usage 2>/dev/null; du -sh /var/log/ 2>/dev/null"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "du -sh /var/log/ 2>/dev/null; ls -lhS /var/log/ 2>/dev/null | head -15"
 		}
 		return &Recipe{
@@ -269,7 +268,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueFirewall:
 		cmd := "iptables -L -n --line-numbers 2>/dev/null | head -40; nft list ruleset 2>/dev/null | head -40; ufw status verbose 2>/dev/null"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "pfctl -sr 2>/dev/null | head -30"
 		}
 		return &Recipe{
@@ -281,7 +280,7 @@ func SelectRecipe(userInput string) *Recipe {
 		user := ExtractUsername(strings.ToLower(userInput))
 		cmd := "who; last -5"
 		if user != "" {
-			if runtime.GOOS == "darwin" {
+			if osPlatform == "darwin" {
 				cmd = fmt.Sprintf("id %s 2>/dev/null; dscl . -read /Users/%s 2>/dev/null | head -20", shellEscapeToken(user), shellEscapeToken(user))
 			} else {
 				cmd = fmt.Sprintf("id %s 2>/dev/null; passwd -S %s 2>/dev/null; grep %s /etc/passwd", shellEscapeToken(user), shellEscapeToken(user), shellEscapeToken(user))
@@ -295,7 +294,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueIO:
 		cmd := "iostat -xz 1 2 2>/dev/null | tail -20 || cat /proc/diskstats | head -20"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "iostat -c 2 2>/dev/null"
 		}
 		return &Recipe{
@@ -305,7 +304,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueHardware:
 		cmd := "dmesg -T 2>/dev/null | grep -iE 'error|fail|bad|sector|mce|temperature|thermal' | tail -20"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "system_profiler SPHardwareDataType 2>/dev/null; pmset -g thermlog 2>/dev/null | tail -10"
 		}
 		return &Recipe{
@@ -315,7 +314,7 @@ func SelectRecipe(userInput string) *Recipe {
 		}
 	case IssueBoot:
 		cmd := "journalctl -xb --no-pager 2>/dev/null | tail -40 || dmesg -T | tail -40"
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			cmd = "log show --predicate 'process == \"kernel\"' --last 5m --style compact 2>/dev/null | tail -30"
 		}
 		return &Recipe{
@@ -344,27 +343,27 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 		if !hasHighDiskUsage(firstOutput) {
 			return ""
 		}
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "du -xhd 1 /System/Volumes/Data 2>/dev/null | sort -hr | head -15"
 		}
 		return "du -xhd 1 / 2>/dev/null | sort -hr | head -15"
 	case RecipeMemoryPressure:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "ps -eo pid,rss,comm -r | head -10"
 		}
 		return "ps -eo pid,rss,comm --sort=-rss | head -10"
 	case RecipePerformanceCPU:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "ps -eo pid,pcpu,comm -r | head -10"
 		}
 		return "ps -eo pid,pcpu,comm --sort=-pcpu | head -10"
 	case RecipeDNSResolution:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "netstat -rn"
 		}
 		return "ip route"
 	case RecipeNetworkConnectivity:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "netstat -rn"
 		}
 		return "ip route"
@@ -384,7 +383,7 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 	case RecipePortConflict:
 		port := r.ServiceName
 		if port != "" {
-			if runtime.GOOS == "darwin" {
+			if osPlatform == "darwin" {
 				return fmt.Sprintf("lsof -iTCP:%s -sTCP:LISTEN -P -n", shellEscapeToken(port))
 			}
 			return fmt.Sprintf("ss -tlnp | grep %s", shellEscapeToken(port))
@@ -395,7 +394,7 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 	case RecipeGit:
 		return "git log --oneline -5"
 	case RecipeCron:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "log show --predicate 'process == \"cron\"' --last 10m --style compact 2>/dev/null | tail -20"
 		}
 		return "journalctl -u cron -n 20 --no-pager 2>/dev/null || journalctl -u crond -n 20 --no-pager 2>/dev/null"
@@ -407,7 +406,7 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 		if r.ServiceName == "" {
 			return ""
 		}
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return fmt.Sprintf("log show --predicate 'process == \"%s\"' --last 5m --style compact 2>/dev/null | tail -40", r.ServiceName)
 		}
 		return fmt.Sprintf("journalctl -u %s -n 40 --no-pager 2>/dev/null || grep -i %s /var/log/syslog /var/log/messages 2>/dev/null | tail -20", shellEscapeToken(r.ServiceName), shellEscapeToken(r.ServiceName))
@@ -420,19 +419,19 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 	case RecipeSSH:
 		return "cat ~/.ssh/config 2>/dev/null | head -30"
 	case RecipeTime:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "systemsetup -getusingnetworktime 2>/dev/null; systemsetup -gettimezone 2>/dev/null"
 		}
 		return "chronyc tracking 2>/dev/null || ntpq -p 2>/dev/null"
 	case RecipeLog:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "ls -lhS /var/log/ | head -20"
 		}
 		return "journalctl -p err -n 30 --no-pager 2>/dev/null"
 	case RecipeDatabase:
 		return "journalctl -u postgresql -n 30 --no-pager 2>/dev/null || journalctl -u mysql -n 30 --no-pager 2>/dev/null"
 	case RecipeFirewall:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "lsof -iTCP -sTCP:LISTEN -P -n"
 		}
 		return "ss -tlnp"
@@ -440,17 +439,17 @@ func (r *Recipe) FollowUpCommand(firstOutput string) string {
 		if r.ServiceName == "" {
 			return ""
 		}
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return ""
 		}
 		return fmt.Sprintf("faillock --user %s 2>/dev/null; chage -l %s 2>/dev/null", shellEscapeToken(r.ServiceName), shellEscapeToken(r.ServiceName))
 	case RecipeIO:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return ""
 		}
 		return "iotop -obn 1 2>/dev/null | head -15 || cat /proc/diskstats"
 	case RecipeHardware:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "diskutil info / 2>/dev/null | head -20"
 		}
 		return "smartctl -a /dev/sda 2>/dev/null | head -40 || sensors 2>/dev/null"
@@ -515,7 +514,7 @@ func buildDatabaseCommand(dbType string) string {
 	case "redis":
 		return "redis-cli ping 2>/dev/null; systemctl status redis --no-pager 2>/dev/null | head -15 || service redis status 2>/dev/null"
 	default:
-		if runtime.GOOS == "darwin" {
+		if osPlatform == "darwin" {
 			return "lsof -iTCP -sTCP:LISTEN -P -n | grep -E '5432|3306|6379|27017'"
 		}
 		return "ss -tlnp | grep -E '5432|3306|6379|27017' 2>/dev/null || lsof -iTCP -sTCP:LISTEN -P -n | grep -E '5432|3306|6379|27017'"
@@ -523,7 +522,7 @@ func buildDatabaseCommand(dbType string) string {
 }
 
 func buildPackageCommand() string {
-	if runtime.GOOS == "darwin" {
+	if osPlatform == "darwin" {
 		return "brew doctor 2>&1 | head -30"
 	}
 	return "apt list --upgradable 2>/dev/null | head -20 || dpkg --audit 2>/dev/null | head -20"

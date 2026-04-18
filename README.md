@@ -53,7 +53,7 @@ Each release archive (~600 MB) is fully self-contained:
 | `termfix.sh` / `termfix.bat` | Startup orchestrator |
 | `models/` | Fine-tuned diagnostic model (see below) |
 
-### Bundled Model: termfix-cycle12 (Qwen 3.5 0.8B fine-tune)
+### Bundled Model: termfix-cycle14 (Qwen 3.5 0.8B fine-tune)
 
 | Property | Value |
 |----------|-------|
@@ -202,9 +202,28 @@ Key training details:
 - 2000+ examples covering bash commands, file viewing, pattern search, and knowledge questions
 - Native Qwen XML tool calling format (`<function=name><parameter=key>value</parameter></function>`)
 - Trained with the exact system prompt and tool definitions used in production
-- 12 training cycles with automated quality gates (tool selection accuracy, grounding, hallucination detection)
+- 14 training cycles with automated quality gates (tool selection accuracy, grounding, hallucination detection)
 
 See `training/AUTONOMOUS_TRAINING.md` for the full training specification and evaluation criteria.
+
+### Real-World Evaluation
+
+The `training/cycle14/realworld_eval.py` harness tests the model against 52 real-world scenarios in Docker containers. Each scenario injects a specific problem (full disk, broken DNS, expired SSL, crashed service, etc.) and verifies the model picks the right diagnostic commands and identifies the root cause.
+
+```bash
+# Run all 52 scenarios (requires Docker and a running llama-server)
+python3 training/cycle14/realworld_eval.py --server http://localhost:8098
+
+# Run a single scenario
+python3 training/cycle14/realworld_eval.py --server http://localhost:8098 --scenario disk_full_logs
+
+# Adjust turn budget (default: 5)
+python3 training/cycle14/realworld_eval.py --server http://localhost:8098 --max-turns 3
+```
+
+The harness features multi-turn tool calling with error feedback — when commands return empty output, "file not found", or "command not found", the model receives hints to try alternative approaches. Results are saved to `realworld-eval-results/` as JSON for analysis.
+
+Current pass rate: **94% (49/52)** with 5 turns and error feedback.
 
 ## Building from Source
 

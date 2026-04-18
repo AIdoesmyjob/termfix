@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// osPlatform is the detected OS. Package-level var so tests can override it.
+var osPlatform = runtime.GOOS
+
 type FactSection struct {
 	Title   string
 	Content string
@@ -28,7 +31,7 @@ func CollectFacts() *SystemFacts {
 
 func CollectFactsForIssue(issueClass IssueClass) *SystemFacts {
 	facts := &SystemFacts{
-		Platform:    runtime.GOOS,
+		Platform:    osPlatform,
 		CollectedAt: time.Now(),
 	}
 

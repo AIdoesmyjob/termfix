@@ -68,7 +68,7 @@ echo "Starting llama-server on port $PORT with $(basename "$MODEL")..."
 EXTRA_FLAGS=""
 MODEL_LOWER=$(echo "$(basename "$MODEL")" | tr '[:upper:]' '[:lower:]')
 if echo "$MODEL_LOWER" | grep -qE 'qwen3[._]5'; then
-  EXTRA_FLAGS="--temp 0.7 --top-p 0.8 --top-k 20 --repeat-penalty 1.5 --reasoning off --reasoning-format deepseek"
+  EXTRA_FLAGS="--temp 0.3 --top-p 0.9 --repeat-penalty 1.0 --reasoning off --reasoning-format deepseek"
   echo "Detected Qwen 3.5 model, using optimized sampling params (thinking disabled)"
 fi
 
