@@ -21,6 +21,16 @@ const (
 	IssueCron        IssueClass = "cron"
 	IssuePackage     IssueClass = "package"
 	IssueProcess     IssueClass = "process"
+	IssueSSH         IssueClass = "ssh"
+	IssueTime        IssueClass = "time"
+	IssueLog         IssueClass = "log"
+	IssueDatabase    IssueClass = "database"
+	IssueFirewall    IssueClass = "firewall"
+	IssueUser        IssueClass = "user"
+	IssueIO          IssueClass = "io"
+	IssueHardware    IssueClass = "hardware"
+	IssueBoot        IssueClass = "boot"
+	IssueNFS         IssueClass = "nfs"
 )
 
 func BuildDiagnosePrompt(userError string) string {

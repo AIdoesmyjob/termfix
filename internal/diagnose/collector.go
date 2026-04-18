@@ -56,37 +56,134 @@ func ClassifyIssue(userError string) IssueClass {
 	switch {
 	case normalized == "", strings.Contains(normalized, "general system health check"), strings.Contains(normalized, "system health"):
 		return IssueGeneral
-	case containsAny(normalized, "permission denied", "access denied", "chmod", "403"):
+
+	// 1. Permission — very specific trigger phrases
+	case containsAny(normalized, "permission denied", "access denied", "chmod", "403",
+		"selinux", "apparmor", "noexec", "operation not permitted", "eperm", "eacces"):
 		return IssuePermission
+
+	// 2. Port — very specific trigger phrases
 	case containsAny(normalized, "address already in use", "eaddrinuse", "bind failed") ||
 		(containsAny(normalized, "port") && containsAny(normalized, "in use", "conflict", "busy", "listen", "occupied")):
 		return IssuePort
-	case containsAny(normalized, "ssl", "tls", "certificate", "cert", "x509", "expired cert"):
+
+	// 3. SSL/TLS
+	case containsAny(normalized, "ssl", "tls", "certificate", "cert", "x509", "expired cert",
+		"handshake", "ssl_error", "certificate verify"):
 		return IssueSSL
+
+	// 4. Git
 	case containsAny(normalized, "merge conflict", "detached head", "git pull", "git push", "git rebase"):
 		return IssueGit
-	case containsAny(normalized, "cron", "crontab", "scheduled", "timer"):
+
+	// 5. Cron
+	case containsAny(normalized, "cron", "crontab", "scheduled", "timer", "cron job"):
 		return IssueCron
-	case containsAny(normalized, "zombie", "defunct", "too many open files", "ulimit"):
+
+	// 6. Process
+	case containsAny(normalized, "zombie", "defunct", "too many open files", "ulimit",
+		"file descriptor", "fd leak", "orphan", "emfile", "enfile"):
 		return IssueProcess
-	case containsAny(normalized, "apt", "dpkg", "brew", "pip", "locked", "broken package"):
+
+	// 7. NFS — before network (specific mount issues)
+	case containsAny(normalized, "nfs", "stale file handle", "showmount", "rpc") ||
+		(containsAny(normalized, "mount") && containsAny(normalized, "failed", "stuck", "hanging", "timeout")):
+		return IssueNFS
+
+	// 8. Firewall — before network (specific firewall tools)
+	case containsAny(normalized, "firewall", "iptables", "nftables", "ufw") ||
+		(containsAny(normalized, "blocked", "filtered") && containsAny(normalized, "port")):
+		return IssueFirewall
+
+	// 9. SSH — before network/service (require SSH-specific context, not just service name)
+	case containsAny(normalized, "publickey", "host key", "authorized_keys", "ssh connection refused") ||
+		(containsAny(normalized, "ssh", "sshd") && containsAny(normalized, "key", "auth", "login", "connect", "timeout", "refused", "denied", "permission")):
+		return IssueSSH
+
+	// 10. Database — before service (require DB-specific context, not just service name)
+	case (containsAny(normalized, "postgres", "postgresql", "mysql", "mariadb") && containsAny(normalized, "connection", "query", "slow query", "lock", "database", "db", "table", "replication")) ||
+		(containsAny(normalized, "database") && containsAny(normalized, "connection", "refused", "down", "slow", "lock")) ||
+		(containsAny(normalized, "redis") && containsAny(normalized, "down", "connection", "refused")):
+		return IssueDatabase
+
+	// 11. Time/NTP
+	case containsAny(normalized, "ntp", "chrony", "timezone") ||
+		(containsAny(normalized, "clock", "time") && containsAny(normalized, "wrong", "skew", "drift", "sync", "off")):
+		return IssueTime
+
+	// 12. Boot/startup
+	case containsAny(normalized, "boot", "grub", "fstab", "kernel panic", "initramfs", "dracut", "won't boot", "wont boot") ||
+		(containsAny(normalized, "startup") && containsAny(normalized, "fail")):
+		return IssueBoot
+
+	// 13. Hardware
+	case containsAny(normalized, "smart", "bad disk", "disk error", "bad sector", "memory error",
+		"ecc", "mce", "temperature", "overheating", "thermal", "fan", "hardware error"):
+		return IssueHardware
+
+	// 14. User/account
+	case containsAny(normalized, "locked account", "login failed", "cannot login", "password expired",
+		"home directory", "wrong shell", "nologin") ||
+		(containsAny(normalized, "user", "account") && containsAny(normalized, "locked", "expired", "disabled")):
+		return IssueUser
+
+	// 15. Log management (require log-specific context, not just a path)
+	case containsAny(normalized, "journald", "syslog", "log rotation", "logrotate",
+		"logs too big", "log disk") ||
+		(containsAny(normalized, "/var/log") && containsAny(normalized, "big", "large", "size", "rotate", "clean", "disk", "growing")):
+		return IssueLog
+
+	// 16. Disk I/O
+	case containsAny(normalized, "io wait", "iowait", "disk slow", "io bottleneck",
+		"iostat", "disk latency", "disk throughput"):
+		return IssueIO
+
+	// 17. Package
+	case containsAny(normalized, "apt", "dpkg", "brew", "pip", "locked", "broken package",
+		"yum", "dnf", "dependency", "unmet", "held package"):
 		return IssuePackage
-	case containsAny(normalized, "disk", "storage", "space", "filesystem", "partition", "full"):
-		return IssueDisk
-	case containsAny(normalized, "memory", "ram", "swap", "oom", "out of memory"):
+
+	// 18. Memory
+	case containsAny(normalized, "memory", "ram", "swap", "oom", "out of memory",
+		"memory leak", "killed", "cgroup"):
 		return IssueMemory
-	case containsAny(normalized, "cpu", "slow", "sluggish", "hang", "stuck", "beachball", "load", "performance"):
+
+	// 19. Disk
+	case containsAny(normalized, "disk", "storage", "space", "filesystem", "partition", "full",
+		"inode", "enospc", "no space left"):
+		return IssueDisk
+
+	// 20. Docker
+	case containsAny(normalized, "docker", "container", "image", "dockerfile", "compose", "pod",
+		"exit code 137", "oomkilled", "docker network", "docker volume"):
+		return IssueDocker
+
+	// 21. Performance — broad keywords
+	case containsAny(normalized, "cpu", "slow", "sluggish", "hang", "stuck", "beachball",
+		"load", "performance", "load average", "unresponsive", "freezing"):
 		return IssuePerformance
+
+	// 22. DNS
 	case containsAny(normalized, "dns", "resolve", "hostname", "domain", "resolv"):
 		return IssueDNS
-	case containsAny(normalized, "network", "internet", "wifi", "ethernet", "latency", "packet", "routing", "route", "connectivity", "offline"):
+
+	// 23. Network — broadest networking catch-all
+	case containsAny(normalized, "network", "internet", "wifi", "ethernet", "latency", "packet",
+		"routing", "route", "connectivity", "offline",
+		"traceroute", "unreachable", "vpn", "proxy"):
 		return IssueNetwork
-	case containsAny(normalized, "docker", "container", "image", "dockerfile", "compose", "pod"):
-		return IssueDocker
-	case containsAny(normalized, "build", "compile", "npm", "yarn", "pnpm", "cargo", "go build", "make", "webpack", "vite", "tsc", "typescript"):
+
+	// 24. Build
+	case containsAny(normalized, "build", "compile", "npm", "yarn", "pnpm", "cargo", "go build",
+		"make", "webpack", "vite", "tsc", "typescript",
+		"linker", "undefined reference", "cmake", "pkg-config", "missing header"):
 		return IssueBuild
-	case containsAny(normalized, "service", "daemon", "systemd", "launchd", "failed to start", "won't start", "wont start", "crash", "restarting"):
+
+	// 25. Service — broadest catch-all
+	case containsAny(normalized, "service", "daemon", "systemd", "launchd", "failed to start",
+		"won't start", "wont start", "crash", "restarting"):
 		return IssueService
+
 	default:
 		if ExtractServiceName(normalized) != "" {
 			return IssueService
@@ -176,6 +273,47 @@ func planFactsForIssue(issueClass IssueClass) []factCollector {
 			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
 			{Title: "Failed Services", Run: collectFailedServices},
 			{Title: "Recent Service Errors", Run: collectRecentServiceErrors},
+		}
+	case IssueSSH:
+		return []factCollector{
+			{Title: "SSH Keys", Run: func() string { return runCmd("sh", "-c", "ls -la ~/.ssh/ 2>/dev/null") }},
+		}
+	case IssueTime:
+		return []factCollector{
+			{Title: "Time Info", Run: func() string { return runCmd("date", "-u") }},
+		}
+	case IssueLog:
+		return []factCollector{
+			{Title: "Log Size", Run: func() string { return runCmd("sh", "-c", "du -sh /var/log/ 2>/dev/null") }},
+		}
+	case IssueDatabase:
+		return []factCollector{
+			{Title: "DB Ports", Run: collectDBPorts},
+		}
+	case IssueFirewall:
+		return []factCollector{
+			{Title: "Listening Ports", Run: collectListeningPorts},
+		}
+	case IssueUser:
+		return []factCollector{
+			{Title: "User Info", Run: func() string { return runCmd("id") }},
+		}
+	case IssueIO:
+		return []factCollector{
+			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
+		}
+	case IssueHardware:
+		return []factCollector{
+			{Title: "Kernel", Run: func() string { return runCmd("uname", "-a") }},
+		}
+	case IssueBoot:
+		return []factCollector{
+			{Title: "Uptime", Run: func() string { return runCmd("uptime") }},
+			{Title: "Last Boot", Run: func() string { return runCmd("who", "-b") }},
+		}
+	case IssueNFS:
+		return []factCollector{
+			{Title: "Mounts", Run: func() string { return runCmd("mount") }},
 		}
 	default:
 		return []factCollector{
@@ -329,6 +467,16 @@ func collectListeningPorts() string {
 	return ""
 }
 
+func collectDBPorts() string {
+	if runtime.GOOS == "linux" {
+		return runCmd("sh", "-c", "ss -tlnp | grep -E '5432|3306|6379|27017' 2>/dev/null")
+	}
+	if runtime.GOOS == "darwin" {
+		return runCmd("sh", "-c", "lsof -iTCP -sTCP:LISTEN -P -n | grep -E '5432|3306|6379|27017' 2>/dev/null")
+	}
+	return ""
+}
+
 func collectFailedServices() string {
 	if runtime.GOOS == "linux" {
 		return runCmd("systemctl", "--failed", "--no-pager", "--plain")
@@ -356,6 +504,47 @@ func containsAny(value string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+var hostnameRe = regexp.MustCompile(`\b([a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+)\b`)
+
+func ExtractHostname(value string) string {
+	match := hostnameRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+var databaseRe = regexp.MustCompile(`\b(postgres(?:ql)?|mysql|mariadb|redis|mongo(?:db)?|elasticsearch|couchdb|influxdb|memcached)\b`)
+
+func ExtractDatabaseType(value string) string {
+	match := databaseRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return ""
+}
+
+var usernameRe = regexp.MustCompile(`\b(?:user|account|login)\s+['"]?([a-z_][a-z0-9_-]{0,30})['"]?`)
+
+var falsePositiveUsernames = map[string]bool{
+	"the": true, "my": true, "this": true, "a": true,
+	"an": true, "our": true, "your": true, "is": true,
+	"not": true, "can": true, "cannot": true, "no": true,
+	"has": true, "was": true, "mentioned": true, "name": true,
+}
+
+func ExtractUsername(value string) string {
+	match := usernameRe.FindStringSubmatch(strings.ToLower(value))
+	if len(match) >= 2 {
+		name := match[1]
+		if falsePositiveServices[name] || falsePositiveUsernames[name] {
+			return ""
+		}
+		return name
+	}
+	return ""
 }
 
 var serviceNameRe = regexp.MustCompile(`\b(nginx|apache2?|httpd|sshd|ssh|docker|postgres(?:ql)?|mysql|mariadb|redis|kubelet|tailscaled|avahi-daemon|caddy|grafana|prometheus|alertmanager|haproxy|traefik|elasticsearch|kibana|logstash|consul|vault|nomad|envoy|minio|rabbitmq|mosquitto|mongod?|memcached|couchdb|influxdb|telegraf|collectd|chrony|ntpd|dnsmasq|unbound|named|bind9?|postfix|dovecot|openvpn|wireguard)\b`)

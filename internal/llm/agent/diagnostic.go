@@ -149,6 +149,22 @@ func tryStructuredRecipeDiagnostic(recipe *diagnose.Recipe, toolCalls []message.
 		return parsePackageRecipe(recipe, toolCalls, toolResults)
 	case diagnose.RecipeProcess:
 		return parseProcessRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDiskInodes:
+		return parseDiskInodesRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipePermissionMount:
+		return parsePermissionMountRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDNSHosts:
+		return parseDNSHostsRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeSSH:
+		return parseSSHRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeTime:
+		return parseTimeRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeLog:
+		return parseLogRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeDatabase:
+		return parseDatabaseRecipe(recipe, toolCalls, toolResults)
+	case diagnose.RecipeFirewall:
+		return parseFirewallRecipe(recipe, toolCalls, toolResults)
 	default:
 		return "", false
 	}
@@ -2221,6 +2237,302 @@ func parseProcessRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, t
 	}
 	if hasUlimit {
 		d.Remediation = append(d.Remediation, "Increase file descriptor limit if needed: edit `/etc/security/limits.conf` or use `ulimit -n <value>`")
+	}
+	return d.Render(), true
+}
+
+func parseDiskInodesRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+	lines := strings.Split(output, "\n")
+
+	maxIUsePct := 0
+	var findings []string
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		for _, f := range fields {
+			if strings.HasSuffix(f, "%") {
+				pctStr := strings.TrimSuffix(f, "%")
+				pct, err := strconv.Atoi(pctStr)
+				if err == nil && pct > maxIUsePct {
+					maxIUsePct = pct
+				}
+				if err == nil && pct >= 50 {
+					findings = append(findings, fmt.Sprintf("%s: %s inode usage", fields[len(fields)-1], f))
+				}
+				break
+			}
+		}
+	}
+
+	if maxIUsePct == 0 && len(findings) == 0 {
+		return "", false
+	}
+
+	d := DiagnosticResult{
+		Summary:   fmt.Sprintf("Inode usage: highest partition at %d%%", maxIUsePct),
+		RiskLevel: riskFromPercent(maxIUsePct),
+	}
+	for _, f := range findings {
+		d.Findings = append(d.Findings, f)
+	}
+	if maxIUsePct >= 80 {
+		d.Remediation = append(d.Remediation, "Find directories with many small files: `find / -xdev -type d -exec sh -c 'echo \"$(find \"$1\" -maxdepth 1 | wc -l) $1\"' _ {} \\; | sort -rn | head -10`")
+		d.Remediation = append(d.Remediation, "Remove unnecessary small files (temp files, session files, cache)")
+	}
+	return d.Render(), true
+}
+
+func parseSSHRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	risk := "Low"
+	summary := "SSH configuration check"
+
+	badPerms := false
+	permLines := grepLines(output, `(?i)(^[-dlrwxsStT]{10})`)
+	for _, line := range permLines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		perms := fields[0]
+		name := fields[len(fields)-1]
+		if name == ".ssh" || name == "." {
+			if !strings.HasPrefix(perms, "drwx------") {
+				badPerms = true
+			}
+		} else if strings.HasSuffix(name, ".pub") || name == "config" || name == "known_hosts" || name == "authorized_keys" {
+			// public files can be more permissive
+		} else {
+			// private keys must be -rw-------
+			if len(perms) >= 7 && (perms[4] != '-' || perms[5] != '-' || perms[6] != '-') {
+				badPerms = true
+			}
+		}
+	}
+
+	noAgent := strings.Contains(output, "Could not open") || strings.Contains(output, "The agent has no identities")
+	if badPerms {
+		risk = "High"
+		summary = "SSH directory or key file has insecure permissions"
+	} else if noAgent {
+		risk = "Medium"
+		summary = "No SSH keys loaded in agent"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if badPerms {
+		d.Remediation = append(d.Remediation, "Fix permissions: `chmod 700 ~/.ssh && chmod 600 ~/.ssh/*`")
+	}
+	if noAgent {
+		d.Remediation = append(d.Remediation, "Add key to agent: `ssh-add ~/.ssh/id_rsa` (or your key file)")
+	}
+	return d.Render(), true
+}
+
+func parseTimeRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	risk := "Low"
+	summary := "Time/NTP status"
+
+	ntpSynced := strings.Contains(output, "NTP synchronized: yes") || strings.Contains(output, "System clock synchronized: yes")
+	ntpNotSynced := strings.Contains(output, "NTP synchronized: no") || strings.Contains(output, "System clock synchronized: no")
+	ntpEnabled := strings.Contains(output, "NTP enabled: yes") || strings.Contains(output, "NTP service: active")
+
+	if ntpNotSynced {
+		risk = "High"
+		summary = "System clock is NOT synchronized with NTP"
+	} else if ntpSynced && ntpEnabled {
+		summary = "System clock is synchronized with NTP"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if ntpNotSynced {
+		d.Remediation = append(d.Remediation, "Enable NTP: `timedatectl set-ntp true` or install chrony/ntpd")
+	}
+	return d.Render(), true
+}
+
+func parseDatabaseRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	dbType := recipe.ServiceName
+	if dbType == "" {
+		dbType = "database"
+	}
+
+	risk := "Low"
+	summary := fmt.Sprintf("%s status check", dbType)
+
+	accepting := strings.Contains(output, "accepting connections")
+	noConnection := strings.Contains(output, "no response") || strings.Contains(output, "could not connect") ||
+		strings.Contains(strings.ToLower(output), "connection refused") || strings.Contains(output, "is not running")
+
+	if noConnection {
+		risk = "Critical"
+		summary = fmt.Sprintf("%s is not accepting connections", dbType)
+	} else if accepting {
+		summary = fmt.Sprintf("%s is accepting connections", dbType)
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if noConnection {
+		d.Remediation = append(d.Remediation, fmt.Sprintf("Start the %s service and check its logs for errors", dbType))
+	}
+	return d.Render(), true
+}
+
+func parseFirewallRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	dropLines := grepLines(output, `(?i)(DROP|REJECT|deny|block)`)
+	risk := "Low"
+	summary := "Firewall rules check"
+	if len(dropLines) > 0 {
+		risk = "Medium"
+		summary = fmt.Sprintf("Firewall has %d DROP/REJECT rules", len(dropLines))
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 15) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(dropLines) > 0 {
+		d.Remediation = append(d.Remediation, "Review DROP/REJECT rules to ensure they are not blocking desired traffic")
+	}
+	return d.Render(), true
+}
+
+func parseLogRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	risk := "Low"
+	summary := "Log storage check"
+
+	// Look for large sizes
+	sizeRe := regexp.MustCompile(`([\d.]+)\s*([KMGT])`)
+	matches := sizeRe.FindAllStringSubmatch(output, -1)
+	for _, m := range matches {
+		if len(m) >= 3 {
+			val, _ := strconv.ParseFloat(m[1], 64)
+			unit := m[2]
+			if (unit == "G" && val >= 5) || unit == "T" {
+				risk = "High"
+				summary = "Log storage is consuming significant disk space"
+			} else if unit == "G" {
+				risk = "Medium"
+				summary = "Log storage is moderately large"
+			}
+		}
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if risk != "Low" {
+		d.Remediation = append(d.Remediation, "Configure log rotation or clean old logs: `journalctl --vacuum-size=500M` or configure logrotate")
+	}
+	return d.Render(), true
+}
+
+func parsePermissionMountRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	noexecLines := grepLines(output, `(?i)noexec`)
+	risk := "Low"
+	summary := "Mount/permission check"
+	if len(noexecLines) > 0 {
+		risk = "High"
+		summary = "Filesystem(s) mounted with noexec flag"
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(noexecLines) > 0 {
+		d.Remediation = append(d.Remediation, "Remount without noexec: `mount -o remount,exec <mountpoint>` or update /etc/fstab")
+	}
+	return d.Render(), true
+}
+
+func parseDNSHostsRecipe(recipe *diagnose.Recipe, toolCalls []message.ToolCall, toolResults []message.ToolResult) (string, bool) {
+	if len(toolResults) == 0 || strings.TrimSpace(toolResults[0].Content) == "" {
+		return "", false
+	}
+	output := toolResults[0].Content
+
+	hostsEntries := grepLines(output, `\d+\.\d+\.\d+\.\d+`)
+	risk := "Low"
+	summary := "DNS hosts check"
+	if len(hostsEntries) > 0 {
+		risk = "Medium"
+		summary = fmt.Sprintf("Found %d /etc/hosts entries that may override DNS", len(hostsEntries))
+	}
+
+	d := DiagnosticResult{
+		Summary:   summary,
+		RiskLevel: risk,
+	}
+	for _, line := range firstNonEmptyLines(output, 10) {
+		d.Findings = append(d.Findings, line)
+	}
+	if len(hostsEntries) > 0 {
+		d.Remediation = append(d.Remediation, "Review /etc/hosts entries — static entries override DNS resolution")
+		d.Remediation = append(d.Remediation, "Remove or update incorrect entries in /etc/hosts")
 	}
 	return d.Render(), true
 }
