@@ -54,8 +54,7 @@ opencode.md
 # Training intermediate outputs (large model weights, adapters)
 training/output/
 
-# Model files (large, not tracked in git)
-models/*.gguf
+# Model files tracked via Git LFS
 
 # Misc
 disk_usage.txt
