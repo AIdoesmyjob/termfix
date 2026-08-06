@@ -2,6 +2,12 @@
 
 A self-contained, fully offline AI system troubleshooting assistant for the terminal. No API keys, no accounts, no internet required.
 
+GitHub is used as the source repository only. Run `scripts/check-local.sh`
+for the build/test/vet gate, or `scripts/install-local-git-hooks.sh` to run it
+before each push. Build cross-platform binaries locally with
+`scripts/build-release-local.sh vMAJOR.MINOR.PATCH`; output is written to
+`dist-local/`.
+
 Termfix bundles a TUI chat interface, a local LLM inference server, and a fine-tuned diagnostic model into a single download. Extract, run, diagnose.
 
 > **Fork notice:** Termfix is a fork of [OpenCode](https://github.com/opencode-ai/opencode) by [Kujtim Hoxha](https://github.com/kujtimiihoxha) (now continued as [Crush](https://github.com/charmbracelet/crush) by the Charm team). The TUI, tool system, session management, and editor are built on OpenCode's foundation. Termfix modifies it to work fully offline with a bundled local model purpose-trained for system diagnostics.
