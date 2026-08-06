@@ -117,6 +117,10 @@ func ClassifyIssue(userError string) IssueClass {
 	// 12. Boot/startup
 	case containsAny(normalized, "boot", "grub", "fstab", "kernel panic", "initramfs", "dracut", "won't boot", "wont boot") ||
 		(containsAny(normalized, "startup") && containsAny(normalized, "fail")):
+		if ExtractServiceName(normalized) != "" &&
+			containsAny(normalized, "failed to start", "won't start", "wont start", "crash", "restarting") {
+			return IssueService
+		}
 		return IssueBoot
 
 	// 13. Hardware

@@ -154,12 +154,13 @@ func runRipgrep(cmd *exec.Cmd, searchRoot string, limit int) ([]string, error) {
 		if len(p) == 0 {
 			continue
 		}
-		absPath := string(p)
+		matchedPath := string(p)
+		if fileutil.SkipHidden(matchedPath) {
+			continue
+		}
+		absPath := matchedPath
 		if !filepath.IsAbs(absPath) {
 			absPath = filepath.Join(searchRoot, absPath)
-		}
-		if fileutil.SkipHidden(absPath) {
-			continue
 		}
 		matches = append(matches, absPath)
 	}

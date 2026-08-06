@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/AIdoesmyjob/termfix/internal/logging"
+	"github.com/bmatcuk/doublestar/v4"
 )
 
 var (
@@ -43,9 +43,6 @@ func GetRgCmd(globPattern string) *exec.Cmd {
 		"--null",
 	}
 	if globPattern != "" {
-		if !filepath.IsAbs(globPattern) && !strings.HasPrefix(globPattern, "/") {
-			globPattern = "/" + globPattern
-		}
 		rgArgs = append(rgArgs, "--glob", globPattern)
 	}
 	cmd := exec.Command(rgPath, rgArgs...)

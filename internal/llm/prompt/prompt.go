@@ -67,71 +67,36 @@ func getContextFromPaths() string {
 }
 
 func processContextPaths(workDir string, paths []string) string {
-	var (
-		wg       sync.WaitGroup
-		resultCh = make(chan string)
-	)
-
-	// Track processed files to avoid duplicates
+	results := make([]string, 0)
 	processedFiles := make(map[string]bool)
-	var processedMutex sync.Mutex
 
 	for _, path := range paths {
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-
-			if strings.HasSuffix(p, "/") {
-				filepath.WalkDir(filepath.Join(workDir, p), func(path string, d os.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if !d.IsDir() {
-						// Check if we've already processed this file (case-insensitive)
-						processedMutex.Lock()
-						lowerPath := strings.ToLower(path)
-						if !processedFiles[lowerPath] {
-							processedFiles[lowerPath] = true
-							processedMutex.Unlock()
-
-							if result := processFile(path); result != "" {
-								resultCh <- result
-							}
-						} else {
-							processedMutex.Unlock()
+		if strings.HasSuffix(path, "/") {
+			_ = filepath.WalkDir(filepath.Join(workDir, path), func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !d.IsDir() {
+					lowerPath := strings.ToLower(path)
+					if !processedFiles[lowerPath] {
+						processedFiles[lowerPath] = true
+						if result := processFile(path); result != "" {
+							results = append(results, result)
 						}
 					}
-					return nil
-				})
-			} else {
-				fullPath := filepath.Join(workDir, p)
-
-				// Check if we've already processed this file (case-insensitive)
-				processedMutex.Lock()
-				lowerPath := strings.ToLower(fullPath)
-				if !processedFiles[lowerPath] {
-					processedFiles[lowerPath] = true
-					processedMutex.Unlock()
-
-					result := processFile(fullPath)
-					if result != "" {
-						resultCh <- result
-					}
-				} else {
-					processedMutex.Unlock()
+				}
+				return nil
+			})
+		} else {
+			fullPath := filepath.Join(workDir, path)
+			lowerPath := strings.ToLower(fullPath)
+			if !processedFiles[lowerPath] {
+				processedFiles[lowerPath] = true
+				if result := processFile(fullPath); result != "" {
+					results = append(results, result)
 				}
 			}
-		}(path)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	results := make([]string, 0)
-	for result := range resultCh {
-		results = append(results, result)
+		}
 	}
 
 	return strings.Join(results, "\n")
